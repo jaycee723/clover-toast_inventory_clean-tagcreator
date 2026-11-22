@@ -383,8 +383,15 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
+    const staticLimiter = rateLimit({
+      windowMs: 15 * 60 * 1000,
+      max: 600,
+      standardHeaders: 'draft-7',
+      legacyHeaders: false
+    });
+    app.use(staticLimiter);
     app.use(express.static(join(__dirname, 'dist')));
-    app.use((req, res) => {
+    app.use(staticLimiter, (req, res) => {
       res.sendFile(join(__dirname, 'dist', 'index.html'));
     });
   }

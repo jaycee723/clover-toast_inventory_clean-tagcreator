@@ -86,12 +86,12 @@ const SPECIAL_BRANDS = new Map([
 
 export function normalizeUnits(s) {
   return s
-    .replace(/\b(\d+(?:\.\d+)?)\s*(?:fl\.?\s?oz\.?)\b/gi, '$1 fl oz')
-    .replace(/\b(\d+(?:\.\d+)?)\s*(?:oz\.?|ounces?)(?![a-z])/gi, '$1 oz')
-    .replace(/\b(\d+(?:\.\d+)?)\s*ml\b/gi, '$1 mL')
-    .replace(/\b(\d+(?:\.\d+)?)\s*(?:ltr|liter|litre|l)\b/gi, '$1 L')
-    .replace(/\b(\d+)\s*(?:pk|pck|pack)\b/gi, '$1 Pack')
-    .replace(/\b(\d+)\s*(?:ct|count)\b/gi, '$1 Count');
+    .replace(/\b(\d{1,4}(?:\.\d{1,3})?)\s{0,3}(?:fl\.?\s?oz\.?)\b/gi, '$1 fl oz')
+    .replace(/\b(\d{1,4}(?:\.\d{1,3})?)\s{0,3}(?:oz\.?|ounces?)(?![a-z])/gi, '$1 oz')
+    .replace(/\b(\d{1,4}(?:\.\d{1,3})?)\s{0,3}ml\b/gi, '$1 mL')
+    .replace(/\b(\d{1,4}(?:\.\d{1,3})?)\s{0,3}(?:ltr|liter|litre|l)\b/gi, '$1 L')
+    .replace(/\b(\d{1,4})\s{0,3}(?:pk|pck|pack)\b/gi, '$1 Pack')
+    .replace(/\b(\d{1,4})\s{0,3}(?:ct|count)\b/gi, '$1 Count');
 }
 
 function titleToken(w, first) {
@@ -122,7 +122,7 @@ export function normalizeName(raw) {
   }
 
   const letters = s
-    .replace(/\d+(?:\.\d+)?\s*(?:fl\.?\s?oz|oz|ml|ltr|liter|litre|l|pk|pck|pack|ct|count)\b/gi, '')
+    .replace(/\b\d{1,4}(?:\.\d{1,3})?\s{0,3}(?:fl\.?\s?oz|oz|ml|ltr|liter|litre|l|pk|pck|pack|ct|count)\b/gi, '')
     .replace(/[^A-Za-z]/g, '');
   const single = letters && (letters === letters.toUpperCase() || letters === letters.toLowerCase());
   s = normalizeUnits(s);

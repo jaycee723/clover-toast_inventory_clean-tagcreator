@@ -2,28 +2,50 @@ name: SonarCloud analysis
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
+  contents: read
   pull-requests: read
 
 jobs:
   Analysis:
-    # Only run if SONAR_TOKEN is configured in repository secrets
-    if: "${{ secrets.SONAR_TOKEN != '' }}"
     runs-on: ubuntu-latest
 
     steps:
-      - name: Analyze with SonarCloud
-        uses: SonarSource/sonarcloud-github-action@master
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check SonarCloud configuration
+        id: check_sonar
         env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+        run: |
+          if [ -n "$SONAR_TOKEN" ] && [ -n "$SONAR_ORGANIZATION" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "project_key=${SONAR_PROJECT_KEY:-clover-toast-inventory-cleaner}" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping SonarCloud scan: SONAR_TOKEN secret or SONAR_ORGANIZATION repository variable is not configured."
+          fi
+
+      - name: Analyze with SonarCloud
+        if: steps.check_sonar.outputs.enabled == 'true'
+        uses: SonarSource/sonarcloud-github-action@v3.1.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           args: >
-            -Dsonar.projectKey=clover-toast-inventory-cleaner
+            -Dsonar.projectKey=${{ steps.check_sonar.outputs.project_key }}
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
             -Dsonar.sources=src,server.ts
             -Dsonar.tests=tests
           projectBaseDir: .

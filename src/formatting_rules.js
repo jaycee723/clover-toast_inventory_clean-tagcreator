@@ -26,9 +26,9 @@ export function generateRuleBasedFormatting(prompt, items) {
     // Volume / Size standardization (e.g. 11oz, 1 L, 750ml)
     if (p.includes('bottle') || p.includes('volume') || p.includes('size') || p.includes('ml') || p.includes('liter') || p.includes('standard') || p.includes('oz')) {
       const volNormalized = newName
-        .replace(/\b(\d+)\s*ml\b/gi, '$1ml')
-        .replace(/\b(\d+(?:\.\d+)?)\s*l(?:tr)?\b/gi, '$1 L')
-        .replace(/\b(\d+)\s*oz\b/gi, '$1oz');
+        .replace(/\b(\d{1,4})\s{0,3}ml\b/gi, '$1ml')
+        .replace(/\b(\d{1,4}(?:\.\d{1,3})?)\s{0,3}l(?:tr)?\b/gi, '$1 L')
+        .replace(/\b(\d{1,4})\s{0,3}oz\b/gi, '$1oz');
       if (volNormalized !== newName) {
         newName = volNormalized;
         reasons.push('Standardized bottle volume notation (e.g. 11oz, 1 L)');
@@ -38,8 +38,8 @@ export function generateRuleBasedFormatting(prompt, items) {
     // Pack standardization
     if (p.includes('pack') || p.includes('pk') || p.includes('can') || p.includes('beer')) {
       const packNormalized = newName
-        .replace(/\b(\d+)\s*(?:pack|pk)\b/gi, '$1-Pack')
-        .replace(/\b(\d+)\s*(?:bottles?|btl)\b/gi, '$1-Bottle');
+        .replace(/\b(\d{1,4})\s{0,3}(?:pack|pk)\b/gi, '$1-Pack')
+        .replace(/\b(\d{1,4})\s{0,3}(?:bottles?|btl)\b/gi, '$1-Bottle');
       if (packNormalized !== newName) {
         newName = packNormalized;
         reasons.push('Standardized multi-pack specification');
@@ -48,7 +48,7 @@ export function generateRuleBasedFormatting(prompt, items) {
 
     // Suffix ordering: move volume or pack to end if requested (linear match without polynomial backtracking)
     if (p.includes('end') && (p.includes('volume') || p.includes('size'))) {
-      const volMatch = newName.match(/\b(\d+(?:\.\d+)?)\s*(ml|l|oz)\b/i);
+      const volMatch = newName.match(/\b(\d{1,4}(?:\.\d{1,3})?)\s{0,3}(ml|l|oz)\b/i);
       if (volMatch && volMatch.index !== undefined) {
         const fullMatch = volMatch[0];
         const unit = volMatch[2].toLowerCase() === 'l' ? 'L' : volMatch[2].toLowerCase();
