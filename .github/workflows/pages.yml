@@ -50,7 +50,7 @@ jobs:
           GITHUB_PAGES: 'true'
         run: npm run build
       - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: dist
       - id: deploy
