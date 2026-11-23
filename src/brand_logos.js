@@ -112,6 +112,55 @@ export async function processLogoImageFile(file, maxDim = 400) {
 }
 
 /**
+ * Resizes and normalizes an existing image data URL (e.g. from Google Logo Search)
+ * using an HTML canvas so dimensions and payload size match uploaded logo files.
+ * @param {string} sourceDataUrl
+ * @param {number} maxDim
+ * @returns {Promise<{ dataUrl: string, width: number, height: number }>}
+ */
+export async function processLogoDataUrl(sourceDataUrl, maxDim = 400) {
+  return new Promise((resolve, reject) => {
+    if (!sourceDataUrl || typeof sourceDataUrl !== 'string' || !sourceDataUrl.startsWith('data:image/')) {
+      return reject(new Error('Invalid image data URL'));
+    }
+
+    const img = new Image();
+    img.onerror = () => reject(new Error('Could not decode fetched logo image'));
+    img.onload = () => {
+      let width = img.width || 200;
+      let height = img.height || 200;
+
+      if (width > maxDim || height > maxDim) {
+        if (width > height) {
+          height = Math.max(1, Math.round((height * maxDim) / width));
+          width = maxDim;
+        } else {
+          width = Math.max(1, Math.round((width * maxDim) / height));
+          height = maxDim;
+        }
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return reject(new Error('Canvas context unavailable'));
+
+      ctx.clearRect(0, 0, width, height);
+      ctx.drawImage(img, 0, 0, width, height);
+
+      let dataUrl = canvas.toDataURL('image/png');
+      if (dataUrl.length > 280000) {
+        dataUrl = canvas.toDataURL('image/jpeg', 0.88);
+      }
+
+      resolve({ dataUrl, width, height });
+    };
+    img.src = sourceDataUrl;
+  });
+}
+
+/**
  * Lists all hosted brand logos from Firestore for the currently logged-in user.
  * Merges with local cache for offline reliability.
  * @returns {Promise<Array<Object>>}

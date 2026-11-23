@@ -19,8 +19,14 @@ export const DEFAULT_AVERY_THEME = {
   borderStyle: 'hairline', // 'none' | 'hairline' | 'dashed' | 'solid-bold'
   borderRadius: 2,
   paddingInches: 0.06,
-  logoPlacement: 'top-right', // 'top-right' | 'top-left' | 'center-top' | 'beside-price'
+  logoPlacement: 'top-right', // 'top-right' | 'top-left' | 'center-top' | 'beside-price' | 'bottom-left' | 'watermark'
   logoScale: 'medium', // 'small' | 'medium' | 'large'
+  logoSizePct: 100, // 50 - 180 fine size percentage
+  logoOpacity: 1, // 0.15 - 1.0
+  logoShape: 'none', // 'none' | 'rounded' | 'circle' | 'bordered'
+  logoBgStyle: 'transparent', // 'transparent' | 'white-badge' | 'tinted-badge'
+  logoPaddingPx: 2, // 0 - 8 px visual padding inside badge/frame
+  logoFit: 'contain', // 'contain' | 'cover'
   showBrandLogos: true,
   showBarcode: true,
   showStoreName: true,
@@ -438,11 +444,107 @@ export function drawVectorBarcode(doc, barcodeDigits, x, y, width, height) {
 }
 
 /**
- * Helper to embed an aspect-ratio-preserved brand logo into the PDF label slot.
+ * Resolves which 1-indexed Avery sheet numbers should be printed or exported
+ * based on the selected mode ('all' | 'current' | 'range').
+ *
+ * @param {number} totalPages
+ * @param {Object} [options]
+ * @param {'all'|'current'|'range'} [options.mode='all']
+ * @param {number} [options.currentPage=1]
+ * @param {number} [options.rangeStart=1]
+ * @param {number} [options.rangeEnd]
+ * @param {string} [options.rangeText='']
+ * @returns {{ pages: number[], valid: boolean, error: string }}
  */
-function embedPdfBrandLogo(doc, logo, slotX, slotY, slotW, slotH, placement = 'top-right', scale = 'medium') {
+export function resolveAveryPrintPages(totalPages, options = {}) {
+  const total = Math.max(0, Math.floor(Number(totalPages) || 0));
+  if (total === 0) {
+    return { pages: [], valid: false, error: 'No sheets available to print.' };
+  }
+
+  const mode = options.mode || 'all';
+  if (mode === 'all') {
+    const pages = Array.from({ length: total }, (_, idx) => idx + 1);
+    return { pages, valid: true, error: '' };
+  }
+
+  if (mode === 'current') {
+    const rawCur = Math.floor(Number(options.currentPage) || 1);
+    const clamped = Math.min(Math.max(1, rawCur), total);
+    return { pages: [clamped], valid: true, error: '' };
+  }
+
+  if (mode === 'range') {
+    const rangeText = typeof options.rangeText === 'string' ? options.rangeText.trim() : '';
+    if (rangeText) {
+      const selected = new Set();
+      const segments = rangeText.split(',').map((s) => s.trim()).filter(Boolean);
+      if (segments.length === 0) {
+        return { pages: [], valid: false, error: `Enter a sheet range between 1 and ${total} (e.g. 1-${total}).` };
+      }
+      for (const seg of segments) {
+        if (/^\d+$/.test(seg)) {
+          const p = Number(seg);
+          if (p < 1 || p > total) {
+            return { pages: [], valid: false, error: `Sheet ${p} is out of range (1–${total}).` };
+          }
+          selected.add(p);
+        } else if (/^\d+\s*-\s*\d+$/.test(seg)) {
+          const [startStr, endStr] = seg.split('-').map((s) => s.trim());
+          const start = Number(startStr);
+          const end = Number(endStr);
+          if (start < 1 || end < 1 || start > total || end > total) {
+            return { pages: [], valid: false, error: `Range "${seg}" is out of bounds (1–${total}).` };
+          }
+          if (start > end) {
+            return { pages: [], valid: false, error: `Range "${seg}" start must be <= end.` };
+          }
+          for (let p = start; p <= end; p++) {
+            selected.add(p);
+          }
+        } else {
+          return { pages: [], valid: false, error: `Invalid range syntax "${seg}". Use e.g. 1-3 or 1, 3, 5.` };
+        }
+      }
+      const pages = Array.from(selected).sort((a, b) => a - b);
+      return { pages, valid: pages.length > 0, error: pages.length ? '' : 'No sheets selected.' };
+    }
+
+    const start = Math.floor(Number(options.rangeStart));
+    const end = Math.floor(Number(options.rangeEnd ?? total));
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+      return { pages: [], valid: false, error: `Enter valid start and end sheet numbers (1–${total}).` };
+    }
+    if (start < 1 || end < 1 || start > total || end > total) {
+      return { pages: [], valid: false, error: `Sheet range must be within 1–${total}.` };
+    }
+    if (start > end) {
+      return { pages: [], valid: false, error: 'Start sheet must be less than or equal to end sheet.' };
+    }
+    const pages = [];
+    for (let p = start; p <= end; p++) {
+      pages.push(p);
+    }
+    return { pages, valid: true, error: '' };
+  }
+
+  return { pages: Array.from({ length: total }, (_, idx) => idx + 1), valid: true, error: '' };
+}
+
+/**
+ * Helper to embed an aspect-ratio-preserved brand logo into the PDF label slot
+ * with full support for custom placement, size %, opacity, shape frame, and background badge.
+ */
+function embedPdfBrandLogo(doc, logo, slotX, slotY, slotW, slotH, placement = 'top-right', scale = 'medium', theme = {}) {
   if (!logo || !logo.imageDataUrl) return null;
-  const maxDim = scale === 'small' ? 0.22 : scale === 'large' ? 0.48 : 0.34;
+
+  const baseMaxDim = scale === 'small' ? 0.22 : scale === 'large' ? 0.48 : 0.34;
+  const sizePct = Math.min(180, Math.max(50, Number(theme.logoSizePct) || 100));
+  const rawMaxDim = baseMaxDim * (sizePct / 100);
+  const maxAllowedW = placement === 'watermark' ? slotW * 0.7 : slotW * 0.42;
+  const maxAllowedH = placement === 'watermark' ? slotH * 0.72 : slotH * 0.65;
+  const maxDim = Math.min(rawMaxDim, Math.max(0.14, Math.min(maxAllowedW, maxAllowedH)));
+
   const aspect = (logo.width && logo.height) ? (logo.width / logo.height) : 1;
   let imgW = maxDim;
   let imgH = maxDim;
@@ -450,6 +552,17 @@ function embedPdfBrandLogo(doc, logo, slotX, slotY, slotW, slotH, placement = 't
     imgH = maxDim / aspect;
   } else {
     imgW = maxDim * aspect;
+  }
+
+  if (imgW > maxAllowedW) {
+    const ratio = maxAllowedW / imgW;
+    imgW *= ratio;
+    imgH *= ratio;
+  }
+  if (imgH > maxAllowedH) {
+    const ratio = maxAllowedH / imgH;
+    imgW *= ratio;
+    imgH *= ratio;
   }
 
   let lx = slotX + slotW - imgW - 0.05;
@@ -464,10 +577,67 @@ function embedPdfBrandLogo(doc, logo, slotX, slotY, slotW, slotH, placement = 't
   } else if (placement === 'beside-price') {
     lx = slotX + slotW - imgW - 0.05;
     ly = slotY + slotH - imgH - 0.06;
+  } else if (placement === 'bottom-left') {
+    lx = slotX + 0.05;
+    ly = slotY + slotH - imgH - 0.05;
+  } else if (placement === 'watermark') {
+    lx = slotX + (slotW - imgW) / 2;
+    ly = slotY + (slotH - imgH) / 2;
   }
 
+  const padIn = Math.min(0.08, Math.max(0, (Number(theme.logoPaddingPx ?? 2) || 0) / 96));
+  const bgStyle = theme.logoBgStyle || 'transparent';
+  const shape = theme.logoShape || 'none';
+  const defaultOpacity = placement === 'watermark' ? 0.22 : 1;
+  const opacity = Math.min(1, Math.max(0.1, Number(theme.logoOpacity ?? defaultOpacity)));
+
+  const boxX = lx - padIn;
+  const boxY = ly - padIn;
+  const boxW = imgW + padIn * 2;
+  const boxH = imgH + padIn * 2;
+
+  const imgFormat = String(logo.imageDataUrl).startsWith('data:image/jpeg') ? 'JPEG' : 'PNG';
+
   try {
-    doc.addImage(logo.imageDataUrl, 'PNG', lx, ly, imgW, imgH);
+    let appliedGState = false;
+    if (opacity < 0.99 && typeof doc.GState === 'function' && typeof doc.setGState === 'function') {
+      doc.setGState(new doc.GState({ opacity }));
+      appliedGState = true;
+    }
+
+    if (bgStyle === 'white-badge' || bgStyle === 'tinted-badge') {
+      if (bgStyle === 'white-badge') {
+        doc.setFillColor(255, 255, 255);
+      } else {
+        doc.setFillColor(241, 245, 249);
+      }
+      if (shape === 'circle') {
+        const radius = Math.max(boxW, boxH) / 2;
+        doc.circle(boxX + boxW / 2, boxY + boxH / 2, radius, 'F');
+      } else if (shape === 'rounded' || shape === 'bordered') {
+        doc.roundedRect(boxX, boxY, boxW, boxH, 0.03, 0.03, 'F');
+      } else {
+        doc.rect(boxX, boxY, boxW, boxH, 'F');
+      }
+    }
+
+    doc.addImage(logo.imageDataUrl, imgFormat, lx, ly, imgW, imgH);
+
+    if (shape === 'bordered' || shape === 'circle' || shape === 'rounded') {
+      doc.setDrawColor(...hexToRgb(theme.borderColor || '#cbd5e1'));
+      doc.setLineWidth(shape === 'bordered' ? 0.008 : 0.005);
+      if (shape === 'circle') {
+        const radius = Math.max(boxW, boxH) / 2;
+        doc.circle(boxX + boxW / 2, boxY + boxH / 2, radius, 'S');
+      } else {
+        doc.roundedRect(boxX, boxY, boxW, boxH, 0.03, 0.03, 'S');
+      }
+    }
+
+    if (appliedGState) {
+      doc.setGState(new doc.GState({ opacity: 1 }));
+    }
+
     return { lx, ly, imgW, imgH, placement };
   } catch (err) {
     console.warn('Could not embed brand logo into PDF:', err);
@@ -560,7 +730,7 @@ export function renderSingleAveryLabel(doc, item, x, y, width, height, template,
   // Large Shelf & Bin Tag (2.0" x 4.0")
   if (template.id === '5163') {
     if (logo) {
-      embeddedLogo = embedPdfBrandLogo(doc, logo, x, y, width, height, theme.logoPlacement, theme.logoScale || 'large');
+      embeddedLogo = embedPdfBrandLogo(doc, logo, x, y, width, height, theme.logoPlacement, theme.logoScale || 'large', theme);
     }
 
     if (showStoreName) {
@@ -613,7 +783,7 @@ export function renderSingleAveryLabel(doc, item, x, y, width, height, template,
   // Shelf Talker (1.0" x 4.0")
   if (template.id === '5161') {
     if (logo) {
-      embeddedLogo = embedPdfBrandLogo(doc, logo, x, y, width, height, theme.logoPlacement, theme.logoScale);
+      embeddedLogo = embedPdfBrandLogo(doc, logo, x, y, width, height, theme.logoPlacement, theme.logoScale, theme);
     }
 
     const topY = y + padY + 0.07;
@@ -667,7 +837,7 @@ export function renderSingleAveryLabel(doc, item, x, y, width, height, template,
   // Square Tag (1.5" x 1.5")
   if (template.id === '94220') {
     if (logo) {
-      embeddedLogo = embedPdfBrandLogo(doc, logo, x, y, width, height, theme.logoPlacement, 'small');
+      embeddedLogo = embedPdfBrandLogo(doc, logo, x, y, width, height, theme.logoPlacement, 'small', theme);
     }
 
     if (showStoreName) {
@@ -705,7 +875,7 @@ export function renderSingleAveryLabel(doc, item, x, y, width, height, template,
 
   // Standard Avery 5160 / 8160 (1.0" x 2.625")
   if (logo) {
-    embeddedLogo = embedPdfBrandLogo(doc, logo, x, y, width, height, theme.logoPlacement, theme.logoScale);
+    embeddedLogo = embedPdfBrandLogo(doc, logo, x, y, width, height, theme.logoPlacement, theme.logoScale, theme);
   }
 
   const topY = y + padY + 0.07;
@@ -774,7 +944,8 @@ export function generateAveryPdf(items, template, options = {}) {
     showCategory = true,
     drawGuides = false,
     theme = DEFAULT_AVERY_THEME,
-    brandLogos = []
+    brandLogos = [],
+    selectedPages = null
   } = options;
 
   const doc = new jsPDF({
@@ -789,7 +960,16 @@ export function generateAveryPdf(items, template, options = {}) {
     return doc;
   }
 
-  pages.forEach((pageItems, pageIndex) => {
+  let pagesToRender = pages;
+  if (Array.isArray(selectedPages) && selectedPages.length > 0) {
+    const allowedSet = new Set(selectedPages.map((p) => Number(p)));
+    pagesToRender = pages.filter((_, idx) => allowedSet.has(idx + 1));
+    if (!pagesToRender.length) {
+      return doc;
+    }
+  }
+
+  pagesToRender.forEach((pageItems, pageIndex) => {
     if (pageIndex > 0) {
       doc.addPage('letter', 'portrait');
     }

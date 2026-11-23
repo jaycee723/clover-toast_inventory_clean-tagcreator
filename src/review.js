@@ -177,6 +177,81 @@ export function updateRowValue(rows, id, field, value) {
 }
 
 /**
+ * Applies a bulk category assignment and/or price adjustment to multiple selected rows.
+ * Preserves each row's _originalSnapshot via updateRowValue so Revert / Revert All
+ * cleanly restores the original imported spreadsheet values.
+ *
+ * @param {Array<Object>} rows
+ * @param {Set<string>|Array<string>} selectedIds
+ * @param {Object} updates
+ * @param {string} [updates.category]
+ * @param {{ mode: 'set'|'add_dollar'|'sub_dollar'|'add_percent'|'sub_percent', value: number }} [updates.priceAdjustment]
+ * @returns {{ updatedCount: number, updatedIds: string[] }}
+ */
+export function bulkUpdateRows(rows, selectedIds, updates = {}) {
+  if (!Array.isArray(rows) || !selectedIds) {
+    return { updatedCount: 0, updatedIds: [] };
+  }
+  const idSet = selectedIds instanceof Set ? selectedIds : new Set(selectedIds);
+  if (idSet.size === 0) {
+    return { updatedCount: 0, updatedIds: [] };
+  }
+
+  const hasCategory = typeof updates.category === 'string' && updates.category.trim().length > 0;
+  const trimmedCategory = hasCategory ? updates.category.trim() : '';
+
+  const adj = updates.priceAdjustment;
+  const validModes = new Set(['set', 'add_dollar', 'sub_dollar', 'add_percent', 'sub_percent']);
+  const hasPriceAdj =
+    adj &&
+    typeof adj === 'object' &&
+    validModes.has(adj.mode) &&
+    Number.isFinite(Number(adj.value));
+  const adjValue = hasPriceAdj ? Number(adj.value) : 0;
+
+  if (!hasCategory && !hasPriceAdj) {
+    return { updatedCount: 0, updatedIds: [] };
+  }
+
+  const updatedIds = [];
+  for (const row of rows) {
+    if (!idSet.has(row.id)) continue;
+
+    if (hasCategory) {
+      updateRowValue(rows, row.id, 'category', trimmedCategory);
+    }
+
+    if (hasPriceAdj) {
+      const currentPrice = parseNumericPrice(row.price) ?? 0;
+      let nextPrice = currentPrice;
+
+      if (adj.mode === 'set') {
+        nextPrice = adjValue;
+      } else if (adj.mode === 'add_dollar') {
+        nextPrice = currentPrice + adjValue;
+      } else if (adj.mode === 'sub_dollar') {
+        nextPrice = currentPrice - adjValue;
+      } else if (adj.mode === 'add_percent') {
+        nextPrice = currentPrice * (1 + adjValue / 100);
+      } else if (adj.mode === 'sub_percent') {
+        nextPrice = currentPrice * (1 - adjValue / 100);
+      }
+
+      if (!Number.isFinite(nextPrice) || nextPrice < 0) {
+        nextPrice = 0;
+      }
+
+      const formatted = (Math.round(nextPrice * 100) / 100).toFixed(2);
+      updateRowValue(rows, row.id, 'price', formatted);
+    }
+
+    updatedIds.push(row.id);
+  }
+
+  return { updatedCount: updatedIds.length, updatedIds };
+}
+
+/**
  * Reverts a row's edits back to its initial Clover loaded values.
  */
 export function revertRowEdit(rows, id) {
@@ -239,3 +314,142 @@ export function autoApproveHighCertainty(rows) {
   }
   return approvedCount;
 }
+
+/**
+ * Safely parses a retail price string or number into a finite numeric value.
+ * Returns null if missing or non-numeric.
+ */
+export function parseNumericPrice(val) {
+  if (val === null || val === undefined || val === '') return null;
+  if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+  const cleaned = String(val).replace(/[^0-9.-]/g, '');
+  if (!cleaned || cleaned === '-' || cleaned === '.') return null;
+  const num = Number.parseFloat(cleaned);
+  return Number.isFinite(num) ? num : null;
+}
+
+/**
+ * Computes median of a sorted ascending numeric array.
+ */
+function computeMedian(sorted) {
+  const n = sorted.length;
+  if (n === 0) return 0;
+  const mid = Math.floor(n / 2);
+  return n % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+/**
+ * Analyzes rows grouped by assigned category and flags items whose price is
+ * unusually high or unusually low compared to their category peers/average.
+ * Strictly read-only: NEVER mutates row prices.
+ *
+ * @param {Array<Object>} rows
+ * @param {Object} [options]
+ * @returns {Map<string, Object>} Map of row.id -> anomaly metadata
+ */
+export function analyzeCategoryPriceAnomalies(rows, options = {}) {
+  const {
+    minCategorySize = 3,
+    highMultiplier = 2.2,
+    extremeHighMultiplier = 3.0,
+    minHighDiff = 5.0,
+    lowMultiplier = 0.4,
+    extremeLowMultiplier = 0.25,
+    minLowDiff = 3.0
+  } = options;
+
+  const anomalies = new Map();
+  if (!Array.isArray(rows) || rows.length === 0) return anomalies;
+
+  // Group positive-priced rows by normalized assigned category
+  const byCategory = new Map();
+  for (const r of rows) {
+    const rawCat = String(
+      (r.decisions?.category === 'accept' && r.proposed_category) ? r.proposed_category : (r.category || '')
+    ).trim();
+    if (!rawCat) continue;
+    const key = rawCat.toLowerCase();
+    const price = parseNumericPrice(r.price);
+    if (price === null || price <= 0) continue;
+
+    if (!byCategory.has(key)) {
+      byCategory.set(key, { label: rawCat, entries: [] });
+    }
+    byCategory.get(key).entries.push({ row: r, price });
+  }
+
+  for (const group of byCategory.values()) {
+    const { label, entries } = group;
+    if (entries.length < minCategorySize) continue;
+
+    const prices = entries.map((e) => e.price);
+    const sum = prices.reduce((acc, p) => acc + p, 0);
+    const categoryAverage = sum / prices.length;
+    const sorted = [...prices].sort((a, b) => a - b);
+    const baseline = computeMedian(sorted);
+    if (baseline <= 0) continue;
+
+    // Also compute robust category average excluding extreme outliers for clearer reference
+    const variance = prices.reduce((acc, p) => acc + Math.pow(p - categoryAverage, 2), 0) / prices.length;
+    const stdDev = Math.sqrt(variance);
+
+    for (const { row, price } of entries) {
+      const ratioToBaseline = price / baseline;
+      const diffFromBaseline = price - baseline;
+      const percentDiffFromAvg = categoryAverage > 0
+        ? Math.round(((price - categoryAverage) / categoryAverage) * 100)
+        : 0;
+      const percentDiffFromBaseline = Math.round(((price - baseline) / baseline) * 100);
+
+      const isHigh =
+        (ratioToBaseline >= highMultiplier && diffFromBaseline >= minHighDiff) ||
+        ratioToBaseline >= extremeHighMultiplier ||
+        (entries.length >= 4 && stdDev > 0 && price > categoryAverage + 2 * stdDev && ratioToBaseline >= 1.8);
+
+      const isLow =
+        (ratioToBaseline <= lowMultiplier && -diffFromBaseline >= minLowDiff) ||
+        ratioToBaseline <= extremeLowMultiplier ||
+        (entries.length >= 4 && stdDev > 0 && price < categoryAverage - 2 * stdDev && ratioToBaseline <= 0.5);
+
+      if (isHigh || isLow) {
+        const status = isHigh ? 'high' : 'low';
+        const directionText = isHigh ? 'above' : 'below';
+        const displayPct = Math.abs(percentDiffFromBaseline);
+        anomalies.set(row.id, {
+          status,
+          price,
+          category: label,
+          categoryAverage: Number(categoryAverage.toFixed(2)),
+          categoryMedian: Number(baseline.toFixed(2)),
+          categoryCount: entries.length,
+          ratio: Number(ratioToBaseline.toFixed(2)),
+          percentDiff: percentDiffFromAvg,
+          percentDiffFromBaseline,
+          message: `Price $${price.toFixed(2)} is unusually ${status} (${displayPct}% ${directionText} typical ${label} price; cat. avg $${categoryAverage.toFixed(2)})`
+        });
+      }
+    }
+  }
+
+  return anomalies;
+}
+
+/**
+ * Summarizes detected price anomalies for banner/filter badges.
+ */
+export function getPriceAnomalySummary(anomalyMap) {
+  let highCount = 0;
+  let lowCount = 0;
+  if (anomalyMap && typeof anomalyMap.values === 'function') {
+    for (const item of anomalyMap.values()) {
+      if (item.status === 'high') highCount++;
+      else if (item.status === 'low') lowCount++;
+    }
+  }
+  return {
+    total: highCount + lowCount,
+    highCount,
+    lowCount
+  };
+}
+

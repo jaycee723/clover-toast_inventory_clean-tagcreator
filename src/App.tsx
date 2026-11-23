@@ -10,6 +10,7 @@ import {
   generateBarcodeSvg,
   formatTagPrice,
   paginateAveryLabels,
+  resolveAveryPrintPages,
   exportAveryCsv,
   generateAveryPdf,
   saveAveryPdf,
@@ -30,6 +31,7 @@ import {
   saveBrandLogo,
   deleteBrandLogo,
   processLogoImageFile,
+  processLogoDataUrl,
   findLogoForProduct
 } from './brand_logos.js';
 import {
@@ -56,9 +58,12 @@ import {
   isApproved,
   computeRowCertainty,
   updateRowValue,
+  bulkUpdateRows,
   revertRowEdit,
   revertAllEdits,
-  autoApproveHighCertainty
+  autoApproveHighCertainty,
+  analyzeCategoryPriceAnomalies,
+  getPriceAnomalySummary
 } from './review.js';
 import {
   exportToastRows,
@@ -165,9 +170,16 @@ export function App() {
     totalToastReady: number;
   } | null>(null);
 
-  // Step 3 Interactive Review State
-  const [step3Filter, setStep3Filter] = useState<'flagged' | 'all' | 'modified' | 'approved'>('flagged');
+  // Step 3 Interactive Review & Bulk Edit State
+  const [step3Filter, setStep3Filter] = useState<'flagged' | 'price_alerts' | 'all' | 'modified' | 'approved'>('flagged');
   const [step3Search, setStep3Search] = useState<string>('');
+  const [editingPriceRowId, setEditingPriceRowId] = useState<string | null>(null);
+  const [editingPriceValue, setEditingPriceValue] = useState<string>('');
+  const [step3SelectedIds, setStep3SelectedIds] = useState<Set<string>>(new Set());
+  const [bulkCategoryValue, setBulkCategoryValue] = useState<string>('');
+  const [bulkPriceMode, setBulkPriceMode] = useState<'set' | 'add_dollar' | 'sub_dollar' | 'add_percent' | 'sub_percent'>('set');
+  const [bulkPriceValue, setBulkPriceValue] = useState<string>('');
+  const [bulkEditFeedback, setBulkEditFeedback] = useState<string>('');
 
   // Toast Preview Modal State
   const [previewModalOpen, setPreviewModalOpen] = useState<boolean>(false);
@@ -239,6 +251,12 @@ export function App() {
   const [averyDrawGuides, setAveryDrawGuides] = useState<boolean>(false);
   const [averyPdfPreviewUrl, setAveryPdfPreviewUrl] = useState<string | null>(null);
   const [isPdfModalOpen, setIsPdfModalOpen] = useState<boolean>(false);
+  const [averyPrintMode, setAveryPrintMode] = useState<'all' | 'current' | 'range'>('all');
+  const [averyCurrentPage, setAveryCurrentPage] = useState<number>(1);
+  const [averyRangeStart, setAveryRangeStart] = useState<number>(1);
+  const [averyRangeEnd, setAveryRangeEnd] = useState<number>(1);
+  const [averyRangeText, setAveryRangeText] = useState<string>('');
+  const [averyPrintFeedback, setAveryPrintFeedback] = useState<string>('');
 
   // Custom Theme & Brand Logos State
   const [averyTheme, setAveryTheme] = useState<any>(() => {
@@ -250,6 +268,19 @@ export function App() {
   const [newBrandName, setNewBrandName] = useState<string>('');
   const [isBrandManagerOpen, setIsBrandManagerOpen] = useState<boolean>(false);
   const [isThemeBuilderOpen, setIsThemeBuilderOpen] = useState<boolean>(false);
+  const [logoAddMode, setLogoAddMode] = useState<'upload' | 'google'>('upload');
+  const [logoPendingFile, setLogoPendingFile] = useState<File | null>(null);
+  const [logoPendingPreview, setLogoPendingPreview] = useState<string | null>(null);
+  const [logoDragging, setLogoDragging] = useState<boolean>(false);
+  const [logoSearchQuery, setLogoSearchQuery] = useState<string>('');
+  const [logoSearchLoading, setLogoSearchLoading] = useState<boolean>(false);
+  const [logoSearchResults, setLogoSearchResults] = useState<Array<{ title: string; imageUrl: string; sourceUrl: string; domain: string }>>([]);
+  const [logoSearchSources, setLogoSearchSources] = useState<Array<{ title: string; url: string }>>([]);
+  const [logoSearchGoogleUrl, setLogoSearchGoogleUrl] = useState<string>('');
+  const [logoSearchError, setLogoSearchError] = useState<string>('');
+  const [logoCustomUrl, setLogoCustomUrl] = useState<string>('');
+  const [logoActionMessage, setLogoActionMessage] = useState<string>('');
+  const [logoConfirmDeleteId, setLogoConfirmDeleteId] = useState<string | null>(null);
 
   // Auth, Cloud & Persistent State
   const [currentUser, setCurrentUser] = useState<any>(null);
@@ -616,6 +647,73 @@ export function App() {
     postAnnouncement(`↩️ Reset all ${count} catalog items back to their original Clover imported state.`);
   };
 
+  // Step 3 Bulk Editing (multi-select checkboxes + category / price adjustment)
+  const handleToggleStep3Row = (id: string) => {
+    setStep3SelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleToggleSelectAllVisibleStep3 = (visibleIds: string[]) => {
+    setStep3SelectedIds((prev) => {
+      const allSelected = visibleIds.length > 0 && visibleIds.every((id) => prev.has(id));
+      const next = new Set(prev);
+      if (allSelected) {
+        visibleIds.forEach((id) => next.delete(id));
+      } else {
+        visibleIds.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  };
+
+  const handleClearStep3Selection = () => {
+    setStep3SelectedIds(new Set());
+  };
+
+  const handleApplyBulkCategory = () => {
+    const cat = bulkCategoryValue.trim();
+    if (!cat || step3SelectedIds.size === 0) return;
+    const { updatedCount } = bulkUpdateRows(rows, step3SelectedIds, { category: cat });
+    if (updatedCount > 0) {
+      setRows([...rows]);
+      const msg = `Assigned category "${cat}" to ${updatedCount} selected ${updatedCount === 1 ? 'item' : 'items'}. (Use Revert on any row to undo.)`;
+      setBulkEditFeedback(msg);
+      postAnnouncement(`🏷️ Bulk Edit: ${msg}`);
+    }
+  };
+
+  const handleApplyBulkPrice = () => {
+    const numericVal = Number.parseFloat(bulkPriceValue);
+    if (!Number.isFinite(numericVal) || numericVal < 0 || step3SelectedIds.size === 0) {
+      setBulkEditFeedback('Enter a valid non-negative number for the bulk price adjustment.');
+      return;
+    }
+    const { updatedCount } = bulkUpdateRows(rows, step3SelectedIds, {
+      priceAdjustment: { mode: bulkPriceMode, value: numericVal }
+    });
+    if (updatedCount > 0) {
+      setRows([...rows]);
+      const modeDesc =
+        bulkPriceMode === 'set'
+          ? `set exact price to $${numericVal.toFixed(2)}`
+          : bulkPriceMode === 'add_dollar'
+          ? `increased prices by +$${numericVal.toFixed(2)}`
+          : bulkPriceMode === 'sub_dollar'
+          ? `decreased prices by -$${numericVal.toFixed(2)}`
+          : bulkPriceMode === 'add_percent'
+          ? `increased prices by +${numericVal}%`
+          : `decreased prices by -${numericVal}%`;
+      const msg = `Updated ${updatedCount} selected ${updatedCount === 1 ? 'item' : 'items'}: ${modeDesc}. (Use Revert on any row to undo.)`;
+      setBulkEditFeedback(msg);
+      postAnnouncement(`💲 Bulk Edit: ${msg}`);
+      setBulkPriceValue('');
+    }
+  };
+
   // Express 1-Click Full Clean (Zero-friction few-clicks experience)
   const handleInstantFullCleanAndExport = async () => {
     if (!records.length) {
@@ -907,10 +1005,19 @@ export function App() {
   const unapprovedCount = totalItemsCount - approvedCount;
   const approvedPercentage = totalItemsCount > 0 ? Math.round((approvedCount / totalItemsCount) * 100) : 0;
 
+  // Step 3 Category Price Anomaly Detection (read-only visual alert; never mutates prices)
+  const priceAnomalies = useMemo(() => analyzeCategoryPriceAnomalies(rows), [rows]);
+  const priceAnomalySummary = useMemo(() => getPriceAnomalySummary(priceAnomalies), [priceAnomalies]);
+
   // Step 3 Filtered Rows
-  const evaluatedRows = rows.map((r) => ({ row: r, cert: computeRowCertainty(r) }));
-  const filteredStep3Rows = evaluatedRows.filter(({ row, cert }) => {
-    if (step3Filter === 'flagged' && !cert.flagged) return false;
+  const evaluatedRows = rows.map((r) => {
+    const cert = computeRowCertainty(r);
+    const priceAnomaly = priceAnomalies.get(r.id) || null;
+    return { row: r, cert, priceAnomaly };
+  });
+  const filteredStep3Rows = evaluatedRows.filter(({ row, cert, priceAnomaly }) => {
+    if (step3Filter === 'flagged' && !cert.flagged && !priceAnomaly) return false;
+    if (step3Filter === 'price_alerts' && !priceAnomaly) return false;
     if (step3Filter === 'approved' && !isApproved(row)) return false;
     if (step3Filter === 'modified' && !row.manuallyEdited && !row.proposed_name && !row.proposed_category) return false;
 
@@ -922,7 +1029,26 @@ export function App() {
     const cat = (row.category || '').toLowerCase();
     return n.includes(q) || orig.includes(q) || bc.includes(q) || cat.includes(q);
   });
-  const totalFlaggedCount = evaluatedRows.filter(({ cert }) => cert.flagged).length;
+  const totalFlaggedCount = evaluatedRows.filter(({ cert, priceAnomaly }) => cert.flagged || Boolean(priceAnomaly)).length;
+
+  const availableStep3Categories = useMemo(() => {
+    const base = [
+      'LIQUOR/SPIRITS',
+      'BEER',
+      'WINE',
+      'RTD (READY TO DRINK)',
+      'CANDY/SNACKS',
+      'DRINKS',
+      'TOBACCO PRODUCTS',
+      'VAPES',
+      'Smoke Shop'
+    ];
+    const set = new Set<string>(base);
+    rows.forEach((r) => {
+      if (r.category && String(r.category).trim()) set.add(String(r.category).trim());
+    });
+    return Array.from(set).sort();
+  }, [rows]);
 
   // 4. Step 4: Toast Export and Previews
   const openToastPreview = (format: 'retail' | 'onboarding' | 'menu') => {
@@ -1082,6 +1208,37 @@ export function App() {
     return paginateAveryLabels(averyItemsToPrint, selectedTemplate, averyStartPosition, averyCopies);
   }, [averyItemsToPrint, selectedTemplate, averyStartPosition, averyCopies]);
 
+  useEffect(() => {
+    const total = Math.max(1, averyPagination.totalPages);
+    setAveryCurrentPage((prev) => Math.min(Math.max(1, prev), total));
+    setAveryRangeStart((prev) => Math.min(Math.max(1, prev), total));
+    setAveryRangeEnd((prev) => {
+      if (prev < 1 || prev > total) return total;
+      return prev;
+    });
+  }, [averyPagination.totalPages]);
+
+  const averyResolvedPrintPages = useMemo(() => {
+    return resolveAveryPrintPages(averyPagination.totalPages, {
+      mode: averyPrintMode,
+      currentPage: averyCurrentPage,
+      rangeStart: averyRangeStart,
+      rangeEnd: averyRangeEnd,
+      rangeText: averyRangeText
+    });
+  }, [
+    averyPagination.totalPages,
+    averyPrintMode,
+    averyCurrentPage,
+    averyRangeStart,
+    averyRangeEnd,
+    averyRangeText
+  ]);
+
+  const averySelectedPageSet = useMemo(() => {
+    return new Set(averyResolvedPrintPages.pages);
+  }, [averyResolvedPrintPages.pages]);
+
   const openAveryModal = (source: 'wizard' | 'master' = 'wizard', customItems?: any[]) => {
     setAverySource(source);
     const pool = (source === 'master' || (rows.length === 0 && masterItems.length > 0)) ? masterItems : rows;
@@ -1094,6 +1251,8 @@ export function App() {
     } else if (averySelectedIds.size === 0) {
       setAverySelectedIds(new Set(pool.map((r) => String(r.id || r.barcode))));
     }
+    setAveryCurrentPage(1);
+    setAveryPrintFeedback('');
     setIsAveryModalOpen(true);
   };
 
@@ -1111,8 +1270,19 @@ export function App() {
       setStatusText('No items selected for Avery label PDF export.');
       return;
     }
+    if (!averyResolvedPrintPages.valid) {
+      setAveryPrintFeedback(averyResolvedPrintPages.error || 'Please select a valid sheet range.');
+      return;
+    }
+    setAveryPrintFeedback('');
     const dateStr = new Date().toISOString().slice(0, 10);
-    const filename = `avery_${selectedTemplate.id}_price_tags_${dateStr}.pdf`;
+    const rangeSuffix =
+      averyPrintMode === 'current'
+        ? `_sheet${averyResolvedPrintPages.pages[0]}`
+        : averyPrintMode === 'range'
+        ? `_sheets_${averyResolvedPrintPages.pages[0]}-${averyResolvedPrintPages.pages[averyResolvedPrintPages.pages.length - 1]}`
+        : '';
+    const filename = `avery_${selectedTemplate.id}_price_tags${rangeSuffix}_${dateStr}.pdf`;
     saveAveryPdf(
       items,
       selectedTemplate,
@@ -1125,11 +1295,12 @@ export function App() {
         showCategory: true,
         drawGuides: averyDrawGuides,
         theme: averyTheme,
-        brandLogos
+        brandLogos,
+        selectedPages: averyResolvedPrintPages.pages
       },
       filename
     );
-    postAnnouncement(`📄 Generated and downloaded PDF file "${filename}" matching Avery ${selectedTemplate.code} (${items.length} items, ${averyPagination.totalLabels} labels on ${averyPagination.totalPages} sheets)!`);
+    postAnnouncement(`📄 Downloaded PDF "${filename}" matching Avery ${selectedTemplate.code} (${averyResolvedPrintPages.pages.length} of ${averyPagination.totalPages} sheet${averyPagination.totalPages > 1 ? 's' : ''})!`);
   };
 
   const handleOpenAveryPdf = () => {
@@ -1138,6 +1309,11 @@ export function App() {
       setStatusText('No items selected for Avery label PDF.');
       return;
     }
+    if (!averyResolvedPrintPages.valid) {
+      setAveryPrintFeedback(averyResolvedPrintPages.error || 'Please select a valid sheet range.');
+      return;
+    }
+    setAveryPrintFeedback('');
     const { url } = getAveryPdfBlobUrl(items, selectedTemplate, {
       startPosition: averyStartPosition,
       copiesPerItem: averyCopies,
@@ -1147,7 +1323,8 @@ export function App() {
       showCategory: true,
       drawGuides: averyDrawGuides,
       theme: averyTheme,
-      brandLogos
+      brandLogos,
+      selectedPages: averyResolvedPrintPages.pages
     });
     setAveryPdfPreviewUrl(url);
     setIsPdfModalOpen(true);
@@ -1231,52 +1408,175 @@ export function App() {
     }
   };
 
-  // Brand Logo Management handlers
-  const handleUploadBrandLogo = async (file: File) => {
+  // Brand Logo Management handlers (Photo Upload + Google Image Search)
+  const upsertBrandLogoInState = (saved: any) => {
+    setBrandLogos((prev) => {
+      const idx = prev.findIndex((l) => l.brandKey === saved.brandKey || l.id === saved.id);
+      if (idx >= 0) {
+        const copy = [...prev];
+        copy[idx] = saved;
+        return copy;
+      }
+      return [saved, ...prev];
+    });
+  };
+
+  const handleStageLogoPhoto = (file: File) => {
+    if (!file || !file.type.startsWith('image/')) {
+      setLogoActionMessage('Please choose a valid image file (PNG, JPG, WebP, or GIF).');
+      return;
+    }
+    setLogoPendingFile(file);
+    setLogoActionMessage('');
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      if (typeof e.target?.result === 'string') {
+        setLogoPendingPreview(e.target.result);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleUploadBrandLogo = async (fileOverride?: File) => {
+    const targetFile = fileOverride || logoPendingFile;
     if (!newBrandName.trim()) {
-      alert('Please enter the brand name first (e.g. "Jack Daniel\'s")');
+      setLogoActionMessage('Please enter a Brand Name above first (e.g. "Jack Daniel\'s").');
+      return;
+    }
+    if (!targetFile) {
+      setLogoActionMessage('Please choose or drop a photo to upload.');
       return;
     }
     setBrandLogoUploading(true);
+    setLogoActionMessage('');
     try {
-      const { dataUrl, width, height } = await processLogoImageFile(file, 400);
+      const { dataUrl, width, height } = await processLogoImageFile(targetFile, 400);
       const saved = await saveBrandLogo({
         brandName: newBrandName.trim(),
         imageDataUrl: dataUrl,
         width,
         height
       });
-      setBrandLogos((prev) => {
-        const idx = prev.findIndex((l) => l.brandKey === saved.brandKey);
-        if (idx >= 0) {
-          const copy = [...prev];
-          copy[idx] = saved;
-          return copy;
-        }
-        return [saved, ...prev];
-      });
-      setNewBrandName('');
-      postAnnouncement(`🏷️ Hosted logo for brand "${saved.brandName}"! Automatically linked to matching items.`);
+      upsertBrandLogoInState(saved);
+      setLogoPendingFile(null);
+      setLogoPendingPreview(null);
+      setLogoActionMessage(`✓ Saved logo photo for "${saved.brandName}" and linked to matching tags.`);
+      postAnnouncement(`🏷️ Saved logo for brand "${saved.brandName}"! Automatically linked to matching price tags.`);
     } catch (err: any) {
-      alert(`Logo upload failed: ${err.message || String(err)}`);
+      setLogoActionMessage(`Logo upload failed: ${err?.message || String(err)}`);
+    } finally {
+      setBrandLogoUploading(false);
+    }
+  };
+
+  const handleSearchGoogleLogos = async () => {
+    const queryText = (logoSearchQuery.trim() || newBrandName.trim());
+    if (!queryText) {
+      setLogoSearchError('Enter a brand name to search Google for logo images.');
+      return;
+    }
+    if (!newBrandName.trim()) {
+      setNewBrandName(queryText);
+    }
+    setLogoSearchQuery(queryText);
+    setLogoSearchLoading(true);
+    setLogoSearchError('');
+    setLogoActionMessage('');
+    setLogoSearchResults([]);
+    setLogoSearchSources([]);
+
+    try {
+      const resp = await fetch('/api/brand-logo/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: queryText })
+      });
+      const data = await resp.json();
+      if (data.googleImagesUrl) {
+        setLogoSearchGoogleUrl(data.googleImagesUrl);
+      }
+      if (!resp.ok || !data.ok) {
+        setLogoSearchError(data.error || 'Could not retrieve logo results from Google.');
+        return;
+      }
+      setLogoSearchResults(Array.isArray(data.results) ? data.results : []);
+      setLogoSearchSources(Array.isArray(data.groundingSources) ? data.groundingSources : []);
+      if (!data.results || data.results.length === 0) {
+        setLogoSearchError('No direct raster logo URLs were returned. Use the Google Images link below to find an image URL or upload a photo.');
+      }
+    } catch (err: any) {
+      setLogoSearchError(`Search request failed: ${err?.message || String(err)}`);
+      setLogoSearchGoogleUrl(`https://www.google.com/search?tbm=isch&q=${encodeURIComponent(`${queryText} logo png`)}`);
+    } finally {
+      setLogoSearchLoading(false);
+    }
+  };
+
+  const handleImportRemoteLogoUrl = async (imageUrl: string) => {
+    const targetBrand = (newBrandName.trim() || logoSearchQuery.trim());
+    if (!targetBrand) {
+      setLogoActionMessage('Please enter a Brand Name above first.');
+      return;
+    }
+    if (!imageUrl || !imageUrl.trim()) {
+      setLogoActionMessage('Please paste a direct HTTPS image URL.');
+      return;
+    }
+
+    setBrandLogoUploading(true);
+    setLogoActionMessage('');
+    setLogoSearchError('');
+    try {
+      const resp = await fetch('/api/brand-logo/fetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: imageUrl.trim() })
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok || !data.dataUrl) {
+        throw new Error(data.error || 'Could not download the selected logo image.');
+      }
+      const { dataUrl, width, height } = await processLogoDataUrl(data.dataUrl, 400);
+      const saved = await saveBrandLogo({
+        brandName: targetBrand,
+        imageDataUrl: dataUrl,
+        width,
+        height
+      });
+      upsertBrandLogoInState(saved);
+      setNewBrandName(saved.brandName);
+      setLogoCustomUrl('');
+      setLogoActionMessage(`✓ Imported Google logo for "${saved.brandName}" and linked to matching tags.`);
+      postAnnouncement(`🏷️ Added Google logo for "${saved.brandName}" to your price tag library!`);
+    } catch (err: any) {
+      setLogoActionMessage(`Could not import image: ${err?.message || String(err)}`);
     } finally {
       setBrandLogoUploading(false);
     }
   };
 
   const handleDeleteBrandLogo = async (logoId: string, brandName: string) => {
-    if (!window.confirm(`Delete logo for brand "${brandName}"?`)) return;
     try {
       await deleteBrandLogo(logoId);
       setBrandLogos((prev) => prev.filter((l) => l.id !== logoId));
+      setLogoConfirmDeleteId(null);
+      setLogoActionMessage(`Deleted logo for "${brandName}".`);
       postAnnouncement(`Deleted logo for "${brandName}".`);
     } catch (err: any) {
-      alert(`Could not delete logo: ${err.message || String(err)}`);
+      setLogoActionMessage(`Could not delete logo: ${err?.message || String(err)}`);
     }
   };
 
   const handlePrintAverySheets = () => {
-    handleSaveAveryPdf();
+    if (averyPagination.totalPages === 0) {
+      setAveryPrintFeedback('No sheets available to print.');
+      return;
+    }
+    if (!averyResolvedPrintPages.valid || averyResolvedPrintPages.pages.length === 0) {
+      setAveryPrintFeedback(averyResolvedPrintPages.error || 'Select a valid sheet range before printing.');
+      return;
+    }
+    setAveryPrintFeedback('');
     window.print();
   };
 
@@ -1962,8 +2262,9 @@ export function App() {
                       onChange={(e) => setStep3Filter(e.target.value as any)}
                       style={{ padding: '4px 8px', fontSize: 12, background: '#0f172a', color: '#fff', border: '1px solid #475569', borderRadius: 4, marginLeft: 6 }}
                     >
-                      <option value="flagged">⚠️ Flagged for Review (Uncertain Logic)</option>
-                      <option value="all">All Items</option>
+                      <option value="flagged">⚠️ Flagged for Review ({totalFlaggedCount})</option>
+                      <option value="price_alerts">💰 Price Outliers Only ({priceAnomalySummary.total})</option>
+                      <option value="all">All Items ({rows.length})</option>
                       <option value="modified">Modified Items Only</option>
                       <option value="approved">Approved Items Only</option>
                     </select>
@@ -1977,6 +2278,138 @@ export function App() {
                   />
                 </div>
               </div>
+
+              {/* Category Price Outlier Alert Banner */}
+              {priceAnomalySummary.total > 0 && (
+                <div className="price-alert-banner" role="alert">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 16 }}>🚨</span>
+                    <div style={{ fontSize: 12, color: '#fecdd3' }}>
+                      <strong>{priceAnomalySummary.total} potential price entry {priceAnomalySummary.total === 1 ? 'error' : 'errors'} detected</strong>
+                      <span style={{ color: '#cbd5e1', marginLeft: 6 }}>
+                        ({priceAnomalySummary.highCount > 0 ? `${priceAnomalySummary.highCount} unusually high` : ''}
+                        {priceAnomalySummary.highCount > 0 && priceAnomalySummary.lowCount > 0 ? ', ' : ''}
+                        {priceAnomalySummary.lowCount > 0 ? `${priceAnomalySummary.lowCount} unusually low` : ''} vs. category average — prices are never auto-changed)
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn-outline btn-sm"
+                    style={{ borderColor: '#f43f5e', color: '#fda4af' }}
+                    onClick={() => setStep3Filter(step3Filter === 'price_alerts' ? 'flagged' : 'price_alerts')}
+                  >
+                    {step3Filter === 'price_alerts' ? 'Show All Flagged' : `Filter to ${priceAnomalySummary.total} Price Alerts`}
+                  </button>
+                </div>
+              )}
+
+              {/* Bulk Edit Feedback Banner */}
+              {bulkEditFeedback && (
+                <div className="bulk-edit-feedback" role="status">
+                  <span>✓ {bulkEditFeedback}</span>
+                  <button
+                    type="button"
+                    className="btn-outline btn-sm"
+                    style={{ padding: '2px 8px', fontSize: 11 }}
+                    onClick={() => setBulkEditFeedback('')}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
+              {/* Step 3 Multi-Select Bulk Edit Bar */}
+              {step3SelectedIds.size > 0 && (
+                <div className="bulk-edit-bar" role="region" aria-label="Bulk edit selected items">
+                  <div className="bulk-edit-section">
+                    <span className="status-pill" style={{ background: '#1d4ed8', color: '#ffffff', fontWeight: 700, fontSize: 12 }}>
+                      ✓ {step3SelectedIds.size} {step3SelectedIds.size === 1 ? 'item' : 'items'} selected
+                    </span>
+                    <button
+                      type="button"
+                      className="btn-outline btn-sm"
+                      style={{ fontSize: 11, padding: '4px 8px' }}
+                      onClick={() => handleToggleSelectAllVisibleStep3(filteredStep3Rows.map((item) => item.row.id))}
+                    >
+                      {filteredStep3Rows.length > 0 && filteredStep3Rows.every((item) => step3SelectedIds.has(item.row.id))
+                        ? 'Deselect Visible'
+                        : `Select All Visible (${filteredStep3Rows.length})`}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-outline btn-sm"
+                      style={{ fontSize: 11, padding: '4px 8px' }}
+                      onClick={handleClearStep3Selection}
+                    >
+                      Clear
+                    </button>
+                  </div>
+
+                  <div className="bulk-edit-section">
+                    <label style={{ fontSize: 11, color: '#cbd5e1', fontWeight: 600 }}>Category:</label>
+                    <input
+                      type="text"
+                      list="step3-bulk-categories"
+                      className="bulk-edit-input"
+                      style={{ width: 165 }}
+                      placeholder="Assign category…"
+                      value={bulkCategoryValue}
+                      onChange={(e) => setBulkCategoryValue(e.target.value)}
+                    />
+                    <datalist id="step3-bulk-categories">
+                      {availableStep3Categories.map((cat) => (
+                        <option key={cat} value={cat} />
+                      ))}
+                    </datalist>
+                    <button
+                      type="button"
+                      className="btn-toast btn-sm"
+                      style={{ background: '#2563eb' }}
+                      disabled={!bulkCategoryValue.trim()}
+                      onClick={handleApplyBulkCategory}
+                    >
+                      Apply Category
+                    </button>
+
+                    <span className="bulk-edit-divider" aria-hidden="true" />
+
+                    <label style={{ fontSize: 11, color: '#cbd5e1', fontWeight: 600 }}>Price:</label>
+                    <select
+                      className="bulk-edit-select"
+                      value={bulkPriceMode}
+                      onChange={(e) => setBulkPriceMode(e.target.value as any)}
+                      aria-label="Bulk price adjustment mode"
+                    >
+                      <option value="set">Set Exact ($)</option>
+                      <option value="add_dollar">Increase by +$</option>
+                      <option value="sub_dollar">Decrease by -$</option>
+                      <option value="add_percent">Increase by +%</option>
+                      <option value="sub_percent">Decrease by -%</option>
+                    </select>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      className="bulk-edit-input"
+                      style={{ width: 88 }}
+                      placeholder={bulkPriceMode.includes('percent') ? 'e.g. 10' : 'e.g. 9.99'}
+                      value={bulkPriceValue}
+                      onChange={(e) => setBulkPriceValue(e.target.value)}
+                      aria-label="Bulk price adjustment value"
+                    />
+                    <button
+                      type="button"
+                      className="btn-toast btn-sm"
+                      style={{ background: '#059669' }}
+                      disabled={bulkPriceValue.trim() === ''}
+                      onClick={handleApplyBulkPrice}
+                    >
+                      Apply Price
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Online Search Scan Progress Banner */}
               {isScanningOnline && scanProgress && (
@@ -2001,42 +2434,93 @@ export function App() {
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, textAlign: 'left' }}>
                   <thead>
                     <tr style={{ background: '#1e293b', color: '#94a3b8', borderBottom: '1px solid #334155' }}>
-                      <th style={{ padding: '10px 12px', width: 160 }}>Certainty &amp; Status</th>
-                      <th style={{ padding: '10px 12px', minWidth: 240 }}>Item Name (Current / Proposed)</th>
-                      <th style={{ padding: '10px 12px', width: 160 }}>Category</th>
-                      <th style={{ padding: '10px 12px', width: 150 }}>Barcode (SKU)</th>
-                      <th style={{ padding: '10px 12px', width: 90 }}>Price</th>
+                      <th style={{ padding: '10px 10px', width: 38, textAlign: 'center' }}>
+                        <input
+                          type="checkbox"
+                          className="row-checkbox"
+                          aria-label="Select all visible items for bulk edit"
+                          title="Select / deselect all visible items"
+                          checked={
+                            filteredStep3Rows.length > 0 &&
+                            filteredStep3Rows.every(({ row }) => step3SelectedIds.has(row.id))
+                          }
+                          onChange={() => handleToggleSelectAllVisibleStep3(filteredStep3Rows.map(({ row }) => row.id))}
+                        />
+                      </th>
+                      <th style={{ padding: '10px 12px', width: 170 }}>Certainty &amp; Status</th>
+                      <th style={{ padding: '10px 12px', minWidth: 220 }}>Item Name (Current / Proposed)</th>
+                      <th style={{ padding: '10px 12px', width: 155 }}>Category</th>
+                      <th style={{ padding: '10px 12px', width: 145 }}>Barcode (SKU)</th>
+                      <th style={{ padding: '10px 12px', width: 145 }}>Price</th>
                       <th style={{ padding: '10px 12px', width: 140, textAlign: 'right' }}>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     {filteredStep3Rows.length === 0 ? (
                       <tr>
-                        <td colSpan={6} style={{ padding: 24, textAlign: 'center', color: '#94a3b8' }}>
+                        <td colSpan={7} style={{ padding: 24, textAlign: 'center', color: '#94a3b8' }}>
                           {step3Filter === 'flagged' ? (
-                            <>🎉 <strong>No items need review!</strong> All catalog items passed certainty checks. Click "Proceed to Final Toast Export" below.</>
+                            <>🎉 <strong>No items need review!</strong> All catalog items passed certainty and price checks. Click "Proceed to Final Toast Export" below.</>
+                          ) : step3Filter === 'price_alerts' ? (
+                            <>✓ <strong>No price outliers detected!</strong> All priced items fall within normal category ranges.</>
                           ) : (
                             'No items match your filter criteria.'
                           )}
                         </td>
                       </tr>
                     ) : (
-                      filteredStep3Rows.map(({ row, cert }) => (
+                      filteredStep3Rows.map(({ row, cert, priceAnomaly }) => {
+                        const isSelected = step3SelectedIds.has(row.id);
+                        const rowHasFlag = cert.flagged || Boolean(priceAnomaly);
+                        const rowBg = isSelected
+                          ? 'rgba(37, 99, 235, 0.18)'
+                          : priceAnomaly
+                          ? (priceAnomaly.status === 'high' ? 'rgba(136, 19, 55, 0.24)' : 'rgba(120, 53, 15, 0.24)')
+                          : (cert.flagged ? '#2a1a1a' : 'transparent');
+                        const rowBorderLeft = isSelected
+                          ? '3px solid #3b82f6'
+                          : priceAnomaly
+                          ? (priceAnomaly.status === 'high' ? '3px solid #f43f5e' : '3px solid #f59e0b')
+                          : 'none';
+                        return (
                         <tr
                           key={row.id}
                           style={{
                             borderBottom: '1px solid #334155',
-                            background: cert.flagged ? '#2a1a1a' : 'transparent'
+                            background: rowBg,
+                            borderLeft: rowBorderLeft
                           }}
                         >
+                          {/* Multi-Select Checkbox */}
+                          <td style={{ padding: '10px 10px', verticalAlign: 'top', textAlign: 'center' }}>
+                            <input
+                              type="checkbox"
+                              className="row-checkbox"
+                              checked={isSelected}
+                              onChange={() => handleToggleStep3Row(row.id)}
+                              aria-label={`Select ${row.current_name || row.id}`}
+                            />
+                          </td>
+
                           {/* Certainty & Status */}
                           <td style={{ padding: '10px 12px', verticalAlign: 'top' }}>
-                            <span className={cert.flagged ? 'certainty-badge-review' : 'certainty-badge-high'}>
-                              {cert.flagged ? '⚠️ Review Needed' : '✓ High Certainty'}
+                            <span className={rowHasFlag ? 'certainty-badge-review' : 'certainty-badge-high'}>
+                              {rowHasFlag ? '⚠️ Review Needed' : '✓ High Certainty'}
                             </span>
                             {cert.flagged && cert.reasons?.length > 0 && (
                               <div style={{ fontSize: 11, color: '#fca5a5', marginTop: 4 }}>
                                 {cert.reasons.join('; ')}
+                              </div>
+                            )}
+                            {priceAnomaly && (
+                              <div
+                                style={{
+                                  fontSize: 11,
+                                  color: priceAnomaly.status === 'high' ? '#fda4af' : '#fcd34d',
+                                  marginTop: 4
+                                }}
+                              >
+                                {priceAnomaly.status === 'high' ? '▲' : '▼'} {priceAnomaly.message}
                               </div>
                             )}
                             {isApproved(row) && (
@@ -2094,9 +2578,86 @@ export function App() {
 
                           {/* Price */}
                           <td style={{ padding: '10px 12px', verticalAlign: 'top' }}>
-                            <span className="toast-preview-price">
-                              ${formatToastPrice(row.price) || '0.00'}
-                            </span>
+                            {editingPriceRowId === row.id ? (
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                <input
+                                  type="text"
+                                  className="row-edit-input"
+                                  value={editingPriceValue}
+                                  onChange={(e) => setEditingPriceValue(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      handleUpdateRow(row.id, 'price', editingPriceValue);
+                                      setEditingPriceRowId(null);
+                                    } else if (e.key === 'Escape') {
+                                      setEditingPriceRowId(null);
+                                    }
+                                  }}
+                                  placeholder="0.00"
+                                  autoFocus
+                                  aria-label="Edit item price"
+                                />
+                                <div style={{ display: 'flex', gap: 4 }}>
+                                  <button
+                                    type="button"
+                                    className="btn-toast btn-sm"
+                                    style={{ padding: '2px 6px', fontSize: 10 }}
+                                    onClick={() => {
+                                      handleUpdateRow(row.id, 'price', editingPriceValue);
+                                      setEditingPriceRowId(null);
+                                    }}
+                                  >
+                                    Save
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn-outline btn-sm"
+                                    style={{ padding: '2px 6px', fontSize: 10 }}
+                                    onClick={() => setEditingPriceRowId(null)}
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div>
+                                <span
+                                  className="toast-preview-price"
+                                  style={priceAnomaly ? {
+                                    color: priceAnomaly.status === 'high' ? '#fda4af' : '#fcd34d',
+                                    fontWeight: 700
+                                  } : undefined}
+                                >
+                                  ${formatToastPrice(row.price) || '0.00'}
+                                </span>
+                                {priceAnomaly && (
+                                  <div>
+                                    <span
+                                      className={`price-alert-badge ${priceAnomaly.status === 'high' ? 'price-alert-high' : 'price-alert-low'}`}
+                                      title={priceAnomaly.message}
+                                    >
+                                      {priceAnomaly.status === 'high' ? '▲ Unusually High' : '▼ Unusually Low'}
+                                    </span>
+                                    <div className="price-alert-meta">
+                                      Cat. avg: ${priceAnomaly.categoryAverage.toFixed(2)}
+                                      {' '}
+                                      ({priceAnomaly.percentDiff >= 0 ? `+${priceAnomaly.percentDiff}%` : `${priceAnomaly.percentDiff}%`})
+                                    </div>
+                                    <button
+                                      type="button"
+                                      className="price-fix-link"
+                                      onClick={() => {
+                                        setEditingPriceRowId(row.id);
+                                        setEditingPriceValue(formatToastPrice(row.price) || String(row.price || ''));
+                                      }}
+                                      title="Manually correct spreadsheet price typo"
+                                    >
+                                      ✏️ Fix price
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            )}
                           </td>
 
                           {/* Actions */}
@@ -2125,7 +2686,8 @@ export function App() {
                             )}
                           </td>
                         </tr>
-                      ))
+                        );
+                      })
                     )}
                   </tbody>
                 </table>
@@ -2766,7 +3328,7 @@ export function App() {
                   type="button"
                   className="btn-outline btn-sm"
                   onClick={handlePrintAverySheets}
-                  title="Save PDF and open browser print dialog"
+                  title="Send the selected sheet range directly to your browser's print dialog"
                 >
                   🖨️ Browser Print
                 </button>
@@ -3187,9 +3749,9 @@ export function App() {
                       </div>
 
                       <div style={{ fontSize: 11, fontWeight: 600, color: '#94a3b8', textTransform: 'uppercase', marginTop: 4 }}>
-                        Brand Logo Placement
+                        Brand Logo Customization
                       </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                         <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#cbd5e1', cursor: 'pointer' }}>
                           <input
                             type="checkbox"
@@ -3199,36 +3761,145 @@ export function App() {
                           <span>Attach Brand Logos to Matching Items</span>
                         </label>
 
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 4 }}>
-                          <div>
-                            <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 2 }}>Placement:</div>
-                            <select
-                              className="avery-select"
-                              style={{ padding: '4px 6px', fontSize: 11 }}
-                              value={averyTheme.logoPlacement || 'top-right'}
-                              onChange={(e) => handleUpdateTheme({ logoPlacement: e.target.value })}
-                            >
-                              <option value="top-right">Top-Right Corner</option>
-                              <option value="top-left">Top-Left Corner</option>
-                              <option value="center-top">Centered Top</option>
-                              <option value="beside-price">Beside Price</option>
-                            </select>
-                          </div>
+                        {averyTheme.showBrandLogos !== false && (
+                          <>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                              <div>
+                                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 2 }}>Placement:</div>
+                                <select
+                                  className="avery-select"
+                                  style={{ padding: '4px 6px', fontSize: 11 }}
+                                  value={averyTheme.logoPlacement || 'top-right'}
+                                  onChange={(e) => {
+                                    const nextPlacement = e.target.value;
+                                    const updates: any = { logoPlacement: nextPlacement };
+                                    if (nextPlacement === 'watermark' && (averyTheme.logoOpacity ?? 1) > 0.5) {
+                                      updates.logoOpacity = 0.22;
+                                    } else if (nextPlacement !== 'watermark' && (averyTheme.logoOpacity ?? 1) <= 0.25) {
+                                      updates.logoOpacity = 1;
+                                    }
+                                    handleUpdateTheme(updates);
+                                  }}
+                                >
+                                  <option value="top-right">Top-Right Corner</option>
+                                  <option value="top-left">Top-Left Corner</option>
+                                  <option value="center-top">Centered Top</option>
+                                  <option value="beside-price">Beside Price</option>
+                                  <option value="bottom-left">Bottom-Left Corner</option>
+                                  <option value="watermark">Center Watermark</option>
+                                </select>
+                              </div>
 
-                          <div>
-                            <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 2 }}>Logo Scale:</div>
-                            <select
-                              className="avery-select"
-                              style={{ padding: '4px 6px', fontSize: 11 }}
-                              value={averyTheme.logoScale || 'medium'}
-                              onChange={(e) => handleUpdateTheme({ logoScale: e.target.value })}
-                            >
-                              <option value="small">Small (Compact)</option>
-                              <option value="medium">Medium (Standard)</option>
-                              <option value="large">Large (Bold)</option>
-                            </select>
-                          </div>
-                        </div>
+                              <div>
+                                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 2 }}>Base Scale:</div>
+                                <select
+                                  className="avery-select"
+                                  style={{ padding: '4px 6px', fontSize: 11 }}
+                                  value={averyTheme.logoScale || 'medium'}
+                                  onChange={(e) => handleUpdateTheme({ logoScale: e.target.value })}
+                                >
+                                  <option value="small">Small (Compact)</option>
+                                  <option value="medium">Medium (Standard)</option>
+                                  <option value="large">Large (Bold)</option>
+                                </select>
+                              </div>
+                            </div>
+
+                            <div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#cbd5e1' }}>
+                                <span>Fine Logo Size:</span>
+                                <strong>{averyTheme.logoSizePct || 100}%</strong>
+                              </div>
+                              <input
+                                type="range"
+                                min="50"
+                                max="180"
+                                step="5"
+                                value={averyTheme.logoSizePct || 100}
+                                onChange={(e) => handleUpdateTheme({ logoSizePct: Number(e.target.value) })}
+                                style={{ width: '100%' }}
+                              />
+                            </div>
+
+                            <div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#cbd5e1' }}>
+                                <span>Logo Opacity:</span>
+                                <strong>{Math.round((averyTheme.logoOpacity ?? 1) * 100)}%</strong>
+                              </div>
+                              <input
+                                type="range"
+                                min="0.15"
+                                max="1"
+                                step="0.05"
+                                value={averyTheme.logoOpacity ?? 1}
+                                onChange={(e) => handleUpdateTheme({ logoOpacity: Number(e.target.value) })}
+                                style={{ width: '100%' }}
+                              />
+                            </div>
+
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                              <div>
+                                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 2 }}>Frame / Shape:</div>
+                                <select
+                                  className="avery-select"
+                                  style={{ padding: '4px 6px', fontSize: 11 }}
+                                  value={averyTheme.logoShape || 'none'}
+                                  onChange={(e) => handleUpdateTheme({ logoShape: e.target.value })}
+                                >
+                                  <option value="none">None (Clean)</option>
+                                  <option value="rounded">Rounded Frame</option>
+                                  <option value="circle">Circle Badge</option>
+                                  <option value="bordered">Bordered Box</option>
+                                </select>
+                              </div>
+
+                              <div>
+                                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 2 }}>Logo Backdrop:</div>
+                                <select
+                                  className="avery-select"
+                                  style={{ padding: '4px 6px', fontSize: 11 }}
+                                  value={averyTheme.logoBgStyle || 'transparent'}
+                                  onChange={(e) => handleUpdateTheme({ logoBgStyle: e.target.value })}
+                                >
+                                  <option value="transparent">Transparent</option>
+                                  <option value="white-badge">White Badge</option>
+                                  <option value="tinted-badge">Soft Tinted</option>
+                                </select>
+                              </div>
+                            </div>
+
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, alignItems: 'center' }}>
+                              <div>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#cbd5e1' }}>
+                                  <span>Frame Padding:</span>
+                                  <strong>{averyTheme.logoPaddingPx ?? 2}px</strong>
+                                </div>
+                                <input
+                                  type="range"
+                                  min="0"
+                                  max="8"
+                                  step="1"
+                                  value={averyTheme.logoPaddingPx ?? 2}
+                                  onChange={(e) => handleUpdateTheme({ logoPaddingPx: Number(e.target.value) })}
+                                  style={{ width: '100%' }}
+                                />
+                              </div>
+
+                              <div>
+                                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 2 }}>Image Fit:</div>
+                                <select
+                                  className="avery-select"
+                                  style={{ padding: '4px 6px', fontSize: 11 }}
+                                  value={averyTheme.logoFit || 'contain'}
+                                  onChange={(e) => handleUpdateTheme({ logoFit: e.target.value })}
+                                >
+                                  <option value="contain">Contain (Full Logo)</option>
+                                  <option value="cover">Cover (Fill Frame)</option>
+                                </select>
+                              </div>
+                            </div>
+                          </>
+                        )}
                       </div>
 
                       <button
@@ -3243,7 +3914,7 @@ export function App() {
                   )}
                 </div>
 
-                {/* 6. Hosted Brand Logos Manager */}
+                {/* 6. Hosted Brand Logos Manager (Upload Photo + Google Search) */}
                 <div className="avery-control-card">
                   <div
                     className="avery-control-label"
@@ -3257,54 +3928,260 @@ export function App() {
                   {isBrandManagerOpen && (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10 }}>
                       <div style={{ fontSize: 11, color: '#94a3b8' }}>
-                        Upload logos to automatically display on price tags matching that brand name. Saved in Firestore &amp; local storage.
+                        Upload a photo or search Google for a brand logo. Matching inventory items automatically display the logo on their price tags.
                       </div>
 
-                      <div style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 6, padding: 10 }}>
-                        <div style={{ fontSize: 11, color: '#cbd5e1', marginBottom: 4 }}>Add Brand Logo:</div>
+                      <div style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 8, padding: 10 }}>
+                        <div style={{ fontSize: 11, color: '#cbd5e1', fontWeight: 600, marginBottom: 4 }}>
+                          1. Brand Name:
+                        </div>
                         <input
                           type="text"
+                          list="avery-detected-brands"
                           className="avery-input"
-                          style={{ marginBottom: 6 }}
-                          placeholder="Brand name (e.g. Jack Daniel's, Hennessy)"
+                          style={{ marginBottom: 8 }}
+                          placeholder="e.g. Jack Daniel's, Corona, Tito's"
                           value={newBrandName}
-                          onChange={(e) => setNewBrandName(e.target.value)}
+                          onChange={(e) => {
+                            setNewBrandName(e.target.value);
+                            if (logoAddMode === 'google' && !logoSearchQuery) {
+                              setLogoSearchQuery(e.target.value);
+                            }
+                          }}
                         />
-                        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                          <input
-                            type="file"
-                            accept="image/*"
-                            id="brand-logo-file-input"
-                            style={{ display: 'none' }}
-                            onChange={(e) => {
-                              if (e.target.files?.[0]) {
-                                handleUploadBrandLogo(e.target.files[0]);
-                                e.target.value = '';
-                              }
-                            }}
-                          />
+                        <datalist id="avery-detected-brands">
+                          {averyAvailableBrands.map((b) => (
+                            <option key={b} value={b} />
+                          ))}
+                        </datalist>
+
+                        {/* Mode Toggle: Upload Photo vs Search Google */}
+                        <div className="logo-mode-tabs">
                           <button
                             type="button"
-                            className="btn-toast btn-sm"
-                            style={{ background: '#059669', fontSize: 11, flex: 1 }}
-                            disabled={brandLogoUploading}
+                            className={`logo-mode-tab ${logoAddMode === 'upload' ? 'active' : ''}`}
                             onClick={() => {
-                              if (!newBrandName.trim()) {
-                                alert('Please type the Brand Name above first');
-                                return;
-                              }
-                              document.getElementById('brand-logo-file-input')?.click();
+                              setLogoAddMode('upload');
+                              setLogoActionMessage('');
                             }}
                           >
-                            {brandLogoUploading ? 'Uploading…' : '📁 Upload Logo Image'}
+                            📷 Upload Photo
+                          </button>
+                          <button
+                            type="button"
+                            className={`logo-mode-tab ${logoAddMode === 'google' ? 'active' : ''}`}
+                            onClick={() => {
+                              setLogoAddMode('google');
+                              if (!logoSearchQuery && newBrandName.trim()) {
+                                setLogoSearchQuery(newBrandName.trim());
+                              }
+                              setLogoActionMessage('');
+                            }}
+                          >
+                            🔍 Search Google
                           </button>
                         </div>
+
+                        {logoAddMode === 'upload' ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                            <input
+                              type="file"
+                              accept="image/png,image/jpeg,image/webp,image/gif"
+                              id="brand-logo-file-input"
+                              style={{ display: 'none' }}
+                              onChange={(e) => {
+                                if (e.target.files?.[0]) {
+                                  handleStageLogoPhoto(e.target.files[0]);
+                                  e.target.value = '';
+                                }
+                              }}
+                            />
+                            <div
+                              className={`logo-dropzone ${logoDragging ? 'dragging' : ''}`}
+                              onClick={() => document.getElementById('brand-logo-file-input')?.click()}
+                              onDragOver={(e) => {
+                                e.preventDefault();
+                                setLogoDragging(true);
+                              }}
+                              onDragLeave={() => setLogoDragging(false)}
+                              onDrop={(e) => {
+                                e.preventDefault();
+                                setLogoDragging(false);
+                                const dropped = e.dataTransfer?.files?.[0];
+                                if (dropped) handleStageLogoPhoto(dropped);
+                              }}
+                            >
+                              {logoPendingPreview ? (
+                                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+                                  <img
+                                    src={logoPendingPreview}
+                                    alt="Selected logo preview"
+                                    style={{ maxHeight: 68, maxWidth: '100%', objectFit: 'contain', background: '#ffffff', borderRadius: 4, padding: 4 }}
+                                  />
+                                  <span style={{ fontSize: 10, color: '#94a3b8' }}>
+                                    {logoPendingFile?.name} — Click or drop to change photo
+                                  </span>
+                                </div>
+                              ) : (
+                                <div style={{ fontSize: 11, color: '#cbd5e1' }}>
+                                  <div style={{ fontSize: 20, marginBottom: 4 }}>📷</div>
+                                  <div><strong>Click to choose photo</strong> or drag &amp; drop</div>
+                                  <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>PNG, JPG, WebP, or GIF</div>
+                                </div>
+                              )}
+                            </div>
+
+                            <button
+                              type="button"
+                              className="btn-toast btn-sm"
+                              style={{ background: '#059669', fontSize: 11, width: '100%' }}
+                              disabled={brandLogoUploading || !logoPendingFile}
+                              onClick={() => handleUploadBrandLogo()}
+                            >
+                              {brandLogoUploading ? 'Saving Logo…' : '✓ Save Photo as Brand Logo'}
+                            </button>
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                            <div style={{ display: 'flex', gap: 6 }}>
+                              <input
+                                type="text"
+                                className="avery-input"
+                                style={{ flex: 1 }}
+                                placeholder="Search Google for logo…"
+                                value={logoSearchQuery}
+                                onChange={(e) => setLogoSearchQuery(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') handleSearchGoogleLogos();
+                                }}
+                              />
+                              <button
+                                type="button"
+                                className="btn-toast btn-sm"
+                                style={{ background: '#2563eb', fontSize: 11, whiteSpace: 'nowrap' }}
+                                disabled={logoSearchLoading}
+                                onClick={handleSearchGoogleLogos}
+                              >
+                                {logoSearchLoading ? 'Searching…' : '🔍 Search'}
+                              </button>
+                            </div>
+
+                            {logoSearchError && (
+                              <div style={{ fontSize: 11, color: '#fca5a5', background: 'rgba(127, 29, 29, 0.3)', border: '1px solid #991b1b', borderRadius: 6, padding: '6px 8px' }}>
+                                {logoSearchError}
+                              </div>
+                            )}
+
+                            {logoSearchResults.length > 0 && (
+                              <div className="logo-search-grid">
+                                {logoSearchResults.map((cand, idx) => (
+                                  <div key={`${cand.imageUrl}-${idx}`} className="logo-search-card">
+                                    <div className="logo-search-thumb-wrap">
+                                      <img
+                                        src={cand.imageUrl}
+                                        alt={cand.title}
+                                        loading="lazy"
+                                        onError={(e) => {
+                                          (e.currentTarget as HTMLImageElement).style.opacity = '0.25';
+                                        }}
+                                      />
+                                    </div>
+                                    <div style={{ fontSize: 10, color: '#cbd5e1', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={cand.title}>
+                                      {cand.title}
+                                    </div>
+                                    <div style={{ fontSize: 9, color: '#64748b', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                      {cand.domain}
+                                    </div>
+                                    <button
+                                      type="button"
+                                      className="btn-toast btn-sm"
+                                      style={{ background: '#059669', fontSize: 10, padding: '3px 6px' }}
+                                      disabled={brandLogoUploading}
+                                      onClick={() => handleImportRemoteLogoUrl(cand.imageUrl)}
+                                    >
+                                      {brandLogoUploading ? 'Importing…' : '✓ Use Logo'}
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            {logoSearchSources.length > 0 && (
+                              <div style={{ fontSize: 10, color: '#94a3b8' }}>
+                                Sources:{' '}
+                                {logoSearchSources.slice(0, 3).map((src, i) => (
+                                  <React.Fragment key={src.url}>
+                                    {i > 0 && ' · '}
+                                    <a
+                                      href={src.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      style={{ color: '#60a5fa', textDecoration: 'underline' }}
+                                    >
+                                      {src.title}
+                                    </a>
+                                  </React.Fragment>
+                                ))}
+                              </div>
+                            )}
+
+                            {/* Direct Google Images Link + Paste Direct Image URL */}
+                            <div style={{ borderTop: '1px solid #334155', paddingTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                              <a
+                                href={
+                                  logoSearchGoogleUrl ||
+                                  `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(`${(logoSearchQuery || newBrandName || 'brand').trim()} logo png`)}`
+                                }
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                style={{ fontSize: 11, color: '#60a5fa', textDecoration: 'underline' }}
+                              >
+                                🌐 Open Google Images for &ldquo;{(logoSearchQuery || newBrandName || 'brand').trim()} logo&rdquo; ↗
+                              </a>
+                              <div style={{ display: 'flex', gap: 6 }}>
+                                <input
+                                  type="url"
+                                  className="avery-input"
+                                  style={{ flex: 1, fontSize: 11 }}
+                                  placeholder="Or paste HTTPS image URL…"
+                                  value={logoCustomUrl}
+                                  onChange={(e) => setLogoCustomUrl(e.target.value)}
+                                />
+                                <button
+                                  type="button"
+                                  className="btn-secondary btn-sm"
+                                  style={{ fontSize: 10, whiteSpace: 'nowrap' }}
+                                  disabled={brandLogoUploading || !logoCustomUrl.trim()}
+                                  onClick={() => handleImportRemoteLogoUrl(logoCustomUrl)}
+                                >
+                                  Import URL
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {logoActionMessage && (
+                          <div
+                            style={{
+                              marginTop: 8,
+                              fontSize: 11,
+                              color: logoActionMessage.startsWith('✓') ? '#86efac' : '#fda4af',
+                              background: '#0f172a',
+                              border: '1px solid #334155',
+                              borderRadius: 6,
+                              padding: '5px 8px'
+                            }}
+                          >
+                            {logoActionMessage}
+                          </div>
+                        )}
                       </div>
 
-                      <div style={{ maxHeight: 180, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <div style={{ maxHeight: 190, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
                         {brandLogos.length === 0 ? (
                           <div style={{ fontSize: 11, color: '#94a3b8', textAlign: 'center', padding: '10px 0' }}>
-                            No custom brand logos uploaded yet.
+                            No custom brand logos saved yet.
                           </div>
                         ) : (
                           brandLogos.map((logo) => (
@@ -3317,25 +4194,62 @@ export function App() {
                                 background: '#1e293b',
                                 border: '1px solid #334155',
                                 borderRadius: 6,
-                                padding: '6px 10px'
+                                padding: '6px 10px',
+                                gap: 6
                               }}
                             >
-                              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
                                 <img
                                   src={logo.imageDataUrl}
                                   alt={logo.brandName}
-                                  style={{ width: 28, height: 28, objectFit: 'contain', background: '#ffffff', borderRadius: 4, padding: 2 }}
+                                  style={{ width: 28, height: 28, objectFit: 'contain', background: '#ffffff', borderRadius: 4, padding: 2, flexShrink: 0 }}
                                 />
-                                <span style={{ fontSize: 12, fontWeight: 500, color: '#f8fafc' }}>{logo.brandName}</span>
+                                <span style={{ fontSize: 12, fontWeight: 500, color: '#f8fafc', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {logo.brandName}
+                                </span>
                               </div>
-                              <button
-                                type="button"
-                                style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: 13 }}
-                                onClick={() => handleDeleteBrandLogo(logo.id, logo.brandName)}
-                                title="Delete logo"
-                              >
-                                🗑️
-                              </button>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+                                <button
+                                  type="button"
+                                  style={{ background: 'none', border: 'none', color: '#60a5fa', cursor: 'pointer', fontSize: 11 }}
+                                  onClick={() => {
+                                    setNewBrandName(logo.brandName);
+                                    setLogoSearchQuery(logo.brandName);
+                                  }}
+                                  title="Select brand to replace logo"
+                                >
+                                  ✏️
+                                </button>
+                                {logoConfirmDeleteId === logo.id ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      className="btn-outline btn-sm"
+                                      style={{ fontSize: 10, padding: '2px 5px', borderColor: '#ef4444', color: '#fca5a5' }}
+                                      onClick={() => handleDeleteBrandLogo(logo.id, logo.brandName)}
+                                    >
+                                      Confirm
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="btn-outline btn-sm"
+                                      style={{ fontSize: 10, padding: '2px 5px' }}
+                                      onClick={() => setLogoConfirmDeleteId(null)}
+                                    >
+                                      Cancel
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: 13 }}
+                                    onClick={() => setLogoConfirmDeleteId(logo.id)}
+                                    title="Delete logo"
+                                  >
+                                    🗑️
+                                  </button>
+                                )}
+                              </div>
                             </div>
                           ))
                         )}
@@ -3347,41 +4261,177 @@ export function App() {
 
               {/* Right Live Sheet Preview Area */}
               <div className="avery-preview-panel">
-                <div style={{ width: '100%', maxWidth: '8.5in', display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: '#94a3b8', fontSize: 12 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span>📄 Sheet Preview:</span>
-                    <strong style={{ color: '#ffffff' }}>
-                      {averyPagination.totalPages === 0 ? '0 Sheets' : `${averyPagination.totalPages} Sheet${averyPagination.totalPages > 1 ? 's' : ''}`}
-                    </strong>
-                    <span>({averyPagination.totalLabels} tags to print)</span>
+                {/* Print Range Controls Panel (hidden during @media print) */}
+                <div className="avery-print-controls-panel no-print">
+                  <div className="avery-print-controls-row">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: '#cbd5e1' }}>🖨️ Print Scope:</span>
+                      <div className="avery-mode-toggle" role="radiogroup" aria-label="Select sheets to print">
+                        <button
+                          type="button"
+                          className={`avery-mode-btn ${averyPrintMode === 'all' ? 'active' : ''}`}
+                          onClick={() => {
+                            setAveryPrintMode('all');
+                            setAveryPrintFeedback('');
+                          }}
+                        >
+                          All Sheets ({averyPagination.totalPages})
+                        </button>
+                        <button
+                          type="button"
+                          className={`avery-mode-btn ${averyPrintMode === 'current' ? 'active' : ''}`}
+                          onClick={() => {
+                            setAveryPrintMode('current');
+                            setAveryPrintFeedback('');
+                          }}
+                        >
+                          Current Sheet Only
+                        </button>
+                        <button
+                          type="button"
+                          className={`avery-mode-btn ${averyPrintMode === 'range' ? 'active' : ''}`}
+                          onClick={() => {
+                            setAveryPrintMode('range');
+                            setAveryPrintFeedback('');
+                          }}
+                        >
+                          Page Range
+                        </button>
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                      {averyPagination.totalPages > 0 && (
+                        <div className="avery-sheet-nav">
+                          <button
+                            type="button"
+                            className="btn-outline btn-sm"
+                            style={{ padding: '2px 7px', fontSize: 11 }}
+                            disabled={averyCurrentPage <= 1}
+                            onClick={() => setAveryCurrentPage((p) => Math.max(1, p - 1))}
+                            title="Previous sheet"
+                          >
+                            ◀
+                          </button>
+                          <span>
+                            Sheet <strong>{averyCurrentPage}</strong> of <strong>{averyPagination.totalPages}</strong>
+                          </span>
+                          <button
+                            type="button"
+                            className="btn-outline btn-sm"
+                            style={{ padding: '2px 7px', fontSize: 11 }}
+                            disabled={averyCurrentPage >= averyPagination.totalPages}
+                            onClick={() => setAveryCurrentPage((p) => Math.min(averyPagination.totalPages, p + 1))}
+                            title="Next sheet"
+                          >
+                            ▶
+                          </button>
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        className="btn-toast btn-sm"
+                        style={{ background: '#7c3aed' }}
+                        disabled={!averyResolvedPrintPages.valid}
+                        onClick={handleSaveAveryPdf}
+                        title="Save and download genuine PDF file for the selected sheets"
+                      >
+                        💾 Save PDF
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-toast btn-sm"
+                        style={{ background: '#2563eb' }}
+                        disabled={!averyResolvedPrintPages.valid}
+                        onClick={handleOpenAveryPdf}
+                        title="Open and preview PDF for the selected sheets"
+                      >
+                        👁️ Open PDF
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-toast btn-sm"
+                        style={{ background: '#059669' }}
+                        disabled={!averyResolvedPrintPages.valid}
+                        onClick={handlePrintAverySheets}
+                        title="Send the selected sheets to your browser's native print dialog"
+                      >
+                        🖨️ Print Selected ({averyResolvedPrintPages.pages.length})
+                      </button>
+                    </div>
                   </div>
-                  <div style={{ display: 'flex', gap: 8 }}>
-                    <button
-                      type="button"
-                      className="btn-toast btn-sm"
-                      style={{ background: '#7c3aed' }}
-                      onClick={handleSaveAveryPdf}
-                      title="Save and download genuine PDF file"
-                    >
-                      💾 Save PDF
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-toast btn-sm"
-                      style={{ background: '#2563eb' }}
-                      onClick={handleOpenAveryPdf}
-                      title="Open and preview PDF in viewer"
-                    >
-                      👁️ Open PDF
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-outline btn-sm"
-                      onClick={handlePrintAverySheets}
-                      title="Open browser print dialog"
-                    >
-                      🖨️ Print
-                    </button>
+
+                  {averyPrintMode === 'range' && averyPagination.totalPages > 0 && (
+                    <div className="avery-print-controls-row" style={{ borderTop: '1px solid #1e293b', paddingTop: 8 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12, color: '#cbd5e1' }}>
+                        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                          <span>From:</span>
+                          <input
+                            type="number"
+                            min={1}
+                            max={Math.max(1, averyPagination.totalPages)}
+                            className="bulk-edit-input"
+                            style={{ width: 62 }}
+                            value={averyRangeStart}
+                            onChange={(e) => {
+                              setAveryRangeText('');
+                              setAveryRangeStart(Number(e.target.value));
+                            }}
+                          />
+                        </label>
+                        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                          <span>To:</span>
+                          <input
+                            type="number"
+                            min={1}
+                            max={Math.max(1, averyPagination.totalPages)}
+                            className="bulk-edit-input"
+                            style={{ width: 62 }}
+                            value={averyRangeEnd}
+                            onChange={(e) => {
+                              setAveryRangeText('');
+                              setAveryRangeEnd(Number(e.target.value));
+                            }}
+                          />
+                        </label>
+                        <span style={{ color: '#64748b' }}>or custom:</span>
+                        <input
+                          type="text"
+                          className="bulk-edit-input"
+                          style={{ width: 150 }}
+                          placeholder={`e.g. 1-${Math.min(2, averyPagination.totalPages)}${averyPagination.totalPages > 3 ? ', 4' : ''}`}
+                          value={averyRangeText}
+                          onChange={(e) => setAveryRangeText(e.target.value)}
+                          aria-label="Custom page range"
+                        />
+                      </div>
+                      <div style={{ fontSize: 11, color: averyResolvedPrintPages.valid ? '#86efac' : '#fda4af' }}>
+                        {averyResolvedPrintPages.valid
+                          ? `Selected ${averyResolvedPrintPages.pages.length} sheet${averyResolvedPrintPages.pages.length > 1 ? 's' : ''}: #${averyResolvedPrintPages.pages.join(', #')}`
+                          : averyResolvedPrintPages.error}
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, color: '#94a3b8', flexWrap: 'wrap', gap: 6 }}>
+                    <span>
+                      Total: <strong style={{ color: '#f8fafc' }}>{averyPagination.totalPages}</strong> sheet{averyPagination.totalPages !== 1 ? 's' : ''} ({averyPagination.totalLabels} labels)
+                      {averyResolvedPrintPages.valid && averyPagination.totalPages > 0 && (
+                        <>
+                          {' '}· Will print{' '}
+                          <strong style={{ color: '#60a5fa' }}>
+                            {averyPrintMode === 'all'
+                              ? `All ${averyPagination.totalPages} sheets`
+                              : averyPrintMode === 'current'
+                              ? `Sheet #${averyResolvedPrintPages.pages[0]} only`
+                              : `${averyResolvedPrintPages.pages.length} sheet${averyResolvedPrintPages.pages.length > 1 ? 's' : ''} (#${averyResolvedPrintPages.pages.join(', #')})`}
+                          </strong>
+                        </>
+                      )}
+                    </span>
+                    {averyPrintFeedback && (
+                      <span style={{ color: '#fda4af', fontWeight: 600 }}>{averyPrintFeedback}</span>
+                    )}
                   </div>
                 </div>
 
@@ -3394,8 +4444,44 @@ export function App() {
                     </p>
                   </div>
                 ) : (
-                  averyPagination.pages.map((pageItems, pageIdx) => (
-                    <div key={pageIdx} className="avery-sheet-preview-wrap">
+                  averyPagination.pages.map((pageItems, pageIdx) => {
+                    const sheetNum = pageIdx + 1;
+                    const isIncludedInPrint = averySelectedPageSet.has(sheetNum);
+                    // In Current Sheet Only mode, focus the preview strictly on the active sheet
+                    if (averyPrintMode === 'current' && sheetNum !== averyCurrentPage) {
+                      return null;
+                    }
+                    return (
+                    <div
+                      key={pageIdx}
+                      className={`avery-sheet-preview-wrap ${!isIncludedInPrint ? 'avery-sheet-excluded avery-sheet-print-hidden' : ''}`}
+                    >
+                      <div className="avery-sheet-header-bar no-print">
+                        <span>
+                          <strong>Sheet {sheetNum}</strong> of {averyPagination.totalPages}
+                          {' '}({pageItems.filter(Boolean).length} labels)
+                        </span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          {sheetNum !== averyCurrentPage && (
+                            <button
+                              type="button"
+                              className="btn-outline btn-sm"
+                              style={{ fontSize: 10, padding: '1px 6px' }}
+                              onClick={() => setAveryCurrentPage(sheetNum)}
+                            >
+                              Set as Current
+                            </button>
+                          )}
+                          <span
+                            style={{
+                              fontWeight: 600,
+                              color: isIncludedInPrint ? '#86efac' : '#94a3b8'
+                            }}
+                          >
+                            {isIncludedInPrint ? '✓ Included in Print' : 'Skipped by Print Range'}
+                          </span>
+                        </div>
+                      </div>
                       <div
                         className="avery-sheet"
                         style={{
@@ -3440,6 +4526,39 @@ export function App() {
                               ? 'none'
                               : `1px solid ${averyTheme.borderColor || '#e2e8f0'}`;
 
+                            const logoPlacement = averyTheme.logoPlacement || 'top-right';
+                            const baseLogoH = averyTheme.logoScale === 'small' ? 0.22 : averyTheme.logoScale === 'large' ? 0.44 : 0.32;
+                            const logoPct = (Number(averyTheme.logoSizePct) || 100) / 100;
+                            const computedLogoHIn = Number((baseLogoH * logoPct).toFixed(3));
+                            const computedLogoMaxWIn = Number(((logoPlacement === 'watermark' ? 1.2 : 0.65) * logoPct).toFixed(3));
+                            const logoOpacity = averyTheme.logoOpacity ?? (logoPlacement === 'watermark' ? 0.22 : 1);
+                            const logoShape = averyTheme.logoShape || 'none';
+                            const logoBgStyle = averyTheme.logoBgStyle || 'transparent';
+                            const logoPaddingPx = averyTheme.logoPaddingPx ?? 2;
+                            const logoFit = averyTheme.logoFit || 'contain';
+
+                            const sharedLogoStyle: React.CSSProperties = {
+                              height: `${computedLogoHIn}in`,
+                              width: logoShape === 'circle' ? `${computedLogoHIn}in` : undefined,
+                              maxWidth: `${computedLogoMaxWIn}in`,
+                              objectFit: logoFit as any,
+                              opacity: logoOpacity,
+                              padding: `${logoPaddingPx}px`,
+                              borderRadius: logoShape === 'circle' ? '9999px' : (logoShape === 'rounded' || logoShape === 'bordered') ? '4px' : undefined,
+                              border: logoShape === 'bordered'
+                                ? `1.5px solid ${averyTheme.borderColor || '#94a3b8'}`
+                                : (logoShape === 'circle' || logoShape === 'rounded')
+                                ? `1px solid ${averyTheme.borderColor || '#cbd5e1'}`
+                                : undefined,
+                              background: logoBgStyle === 'white-badge'
+                                ? '#ffffff'
+                                : logoBgStyle === 'tinted-badge'
+                                ? '#f1f5f9'
+                                : 'transparent',
+                              boxSizing: 'border-box',
+                              pointerEvents: 'none'
+                            };
+
                             return (
                               <div
                                 key={itemIdx}
@@ -3449,28 +4568,50 @@ export function App() {
                                   background: averyTheme.tagBgColor || '#ffffff',
                                   border: borderCss,
                                   borderRadius: `${averyTheme.borderRadius || 2}px`,
-                                  position: 'relative'
+                                  position: 'relative',
+                                  overflow: 'hidden'
                                 }}
                               >
-                                {/* Brand Logo if Top-Right or Top-Left */}
-                                {logo && (averyTheme.logoPlacement === 'top-right' || averyTheme.logoPlacement === 'top-left') && (
+                                {/* Brand Logo: Watermark */}
+                                {logo && logoPlacement === 'watermark' && (
                                   <img
                                     src={logo.imageDataUrl}
                                     alt={logo.brandName}
                                     style={{
+                                      ...sharedLogoStyle,
                                       position: 'absolute',
-                                      top: '0.04in',
-                                      right: averyTheme.logoPlacement === 'top-right' ? '0.05in' : undefined,
-                                      left: averyTheme.logoPlacement === 'top-left' ? '0.05in' : undefined,
-                                      height: averyTheme.logoScale === 'small' ? '0.22in' : averyTheme.logoScale === 'large' ? '0.44in' : '0.32in',
-                                      maxWidth: '0.6in',
-                                      objectFit: 'contain'
+                                      top: '50%',
+                                      left: '50%',
+                                      transform: 'translate(-50%, -50%)',
+                                      zIndex: 0
+                                    }}
+                                  />
+                                )}
+
+                                {/* Brand Logo: Corner / Top / Bottom-Left Placements */}
+                                {logo && (logoPlacement === 'top-right' || logoPlacement === 'top-left' || logoPlacement === 'center-top' || logoPlacement === 'bottom-left') && (
+                                  <img
+                                    src={logo.imageDataUrl}
+                                    alt={logo.brandName}
+                                    style={{
+                                      ...sharedLogoStyle,
+                                      position: 'absolute',
+                                      top: logoPlacement === 'bottom-left' ? undefined : '0.04in',
+                                      bottom: logoPlacement === 'bottom-left' ? '0.04in' : undefined,
+                                      right: logoPlacement === 'top-right' ? '0.05in' : undefined,
+                                      left: logoPlacement === 'top-left' || logoPlacement === 'bottom-left'
+                                        ? '0.05in'
+                                        : logoPlacement === 'center-top'
+                                        ? '50%'
+                                        : undefined,
+                                      transform: logoPlacement === 'center-top' ? 'translateX(-50%)' : undefined,
+                                      zIndex: 2
                                     }}
                                   />
                                 )}
 
                                 {/* Header: Store or Category */}
-                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', position: 'relative', zIndex: 1 }}>
                                   {averyShowStoreName && (
                                     <div
                                       className="avery-tag-store-header"
@@ -3493,9 +4634,12 @@ export function App() {
                                 <div
                                   className="avery-tag-title"
                                   style={{
+                                    position: 'relative',
+                                    zIndex: 1,
                                     fontSize: `${averyTheme.titleFontSize || (selectedTemplate.id === '5167' ? 7 : selectedTemplate.id === '5163' ? 12 : 8.5)}pt`,
                                     color: averyTheme.titleColor || '#000000',
-                                    paddingRight: (logo && averyTheme.logoPlacement === 'top-right') ? '0.65in' : undefined
+                                    paddingRight: (logo && logoPlacement === 'top-right') ? `${Math.min(0.95, computedLogoMaxWIn + 0.08)}in` : undefined,
+                                    paddingLeft: (logo && logoPlacement === 'top-left') ? `${Math.min(0.95, computedLogoMaxWIn + 0.08)}in` : undefined
                                   }}
                                   title={item.name}
                                 >
@@ -3503,7 +4647,7 @@ export function App() {
                                 </div>
 
                                 {/* Bottom Row: Price & Barcode */}
-                                <div className="avery-tag-bottom-row">
+                                <div className="avery-tag-bottom-row" style={{ position: 'relative', zIndex: 1 }}>
                                   <div className="avery-tag-price-block">
                                     <div
                                       className="avery-tag-price"
@@ -3521,14 +4665,13 @@ export function App() {
                                     )}
                                   </div>
 
-                                  {logo && averyTheme.logoPlacement === 'beside-price' && (
+                                  {logo && logoPlacement === 'beside-price' && (
                                     <img
                                       src={logo.imageDataUrl}
                                       alt={logo.brandName}
                                       style={{
-                                        height: '0.26in',
-                                        maxWidth: '0.5in',
-                                        objectFit: 'contain'
+                                        ...sharedLogoStyle,
+                                        height: `${Math.min(0.42, computedLogoHIn * 0.85)}in`
                                       }}
                                     />
                                   )}
@@ -3554,7 +4697,8 @@ export function App() {
                         </div>
                       </div>
                     </div>
-                  ))
+                  );
+                  })
                 )}
               </div>
             </div>

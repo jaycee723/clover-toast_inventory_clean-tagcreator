@@ -1,16 +1,22 @@
 import express from 'express';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import dns from 'node:dns/promises';
 import { GoogleGenAI, Type } from '@google/genai';
 import rateLimit from 'express-rate-limit';
 import { generateRuleBasedFormatting } from './src/formatting_rules.js';
+import {
+  isPrivateOrReservedIp,
+  validatePublicImageUrl,
+  normalizeAllowedImageMime
+} from './src/url_safety.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
-const PORT = 3000;
-const ALT_PORT = process.env.PORT && Number(process.env.PORT) !== 3000 ? Number(process.env.PORT) : null;
+const isProd = process.env.NODE_ENV === 'production';
+const PORT = isProd && process.env.PORT ? Number(process.env.PORT) : 3000;
 const HOST = '0.0.0.0';
 
 app.use(express.json({ limit: '15mb' }));
@@ -34,6 +40,7 @@ const aiLimiter = rateLimit({
 
 app.use('/api/', apiLimiter);
 app.use('/api/ai/', aiLimiter);
+app.use('/api/brand-logo/search', aiLimiter);
 
 function isGeminiConfigured(): boolean {
   const key = process.env.GEMINI_API_KEY;
@@ -371,6 +378,264 @@ ${JSON.stringify(itemsToScan, null, 2)}`;
   }
 });
 
+/**
+ * Helper to fetch a remote image URL with strict SSRF protection
+ * (HTTPS only, DNS resolution check on every hop, redirect cap, size & MIME check).
+ */
+async function fetchSafeRemoteImage(rawUrl: string) {
+  const MAX_REDIRECTS = 3;
+  const MAX_BYTES = 2 * 1024 * 1024; // 2 MB
+  let currentUrl = rawUrl;
+
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const check = validatePublicImageUrl(currentUrl);
+    if (!check.ok || !check.url) {
+      return { ok: false as const, status: 400, error: check.error || 'Invalid image URL.' };
+    }
+
+    const hostname = check.url.hostname.replace(/^\[|\]$/g, '');
+    let resolvedRecords: Array<{ address: string }>;
+    try {
+      resolvedRecords = await dns.lookup(hostname, { all: true });
+    } catch {
+      return { ok: false as const, status: 400, error: 'Could not resolve image host.' };
+    }
+
+    if (!resolvedRecords || resolvedRecords.length === 0) {
+      return { ok: false as const, status: 400, error: 'Image host resolved to no addresses.' };
+    }
+
+    for (const rec of resolvedRecords) {
+      if (isPrivateOrReservedIp(rec.address)) {
+        return { ok: false as const, status: 403, error: 'Blocked private or reserved destination IP.' };
+      }
+    }
+
+    const response = await fetch(check.url.toString(), {
+      method: 'GET',
+      redirect: 'manual',
+      signal: AbortSignal.timeout(8000),
+      headers: {
+        'User-Agent': 'aistudio-build',
+        Accept: 'image/png,image/jpeg,image/webp,image/gif,*/*;q=0.5'
+      }
+    });
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (!location) {
+        return { ok: false as const, status: 400, error: 'Redirect missing location header.' };
+      }
+      currentUrl = new URL(location, check.url).toString();
+      continue;
+    }
+
+    if (!response.ok) {
+      return {
+        ok: false as const,
+        status: 502,
+        error: `Image server responded with HTTP ${response.status}.`
+      };
+    }
+
+    const mime = normalizeAllowedImageMime(response.headers.get('content-type'));
+    if (!mime) {
+      return {
+        ok: false as const,
+        status: 415,
+        error: 'URL did not return a supported raster image (PNG, JPEG, WebP, or GIF).'
+      };
+    }
+
+    const contentLengthHeader = response.headers.get('content-length');
+    if (contentLengthHeader && Number(contentLengthHeader) > MAX_BYTES) {
+      return { ok: false as const, status: 413, error: 'Image exceeds 2 MB maximum size.' };
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    if (arrayBuffer.byteLength === 0) {
+      return { ok: false as const, status: 400, error: 'Fetched image file is empty.' };
+    }
+    if (arrayBuffer.byteLength > MAX_BYTES) {
+      return { ok: false as const, status: 413, error: 'Image exceeds 2 MB maximum size.' };
+    }
+
+    const base64 = Buffer.from(arrayBuffer).toString('base64');
+    return {
+      ok: true as const,
+      contentType: mime,
+      dataUrl: `data:${mime};base64,${base64}`
+    };
+  }
+
+  return { ok: false as const, status: 400, error: 'Too many redirects while fetching image.' };
+}
+
+/**
+ * POST /api/brand-logo/search
+ * Searches Google via Gemini Search Grounding (gemini-4-hydrogen) for official brand logo image URLs.
+ */
+app.post('/api/brand-logo/search', async (req, res) => {
+  const rawQuery = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
+  if (!rawQuery || rawQuery.length > 120) {
+    return res.status(400).json({ ok: false, error: 'Please enter a brand name (1–120 characters) to search.' });
+  }
+
+  const googleImagesUrl = `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(`${rawQuery} logo png`)}`;
+  const ai = getAi();
+  if (!ai) {
+    return res.status(503).json({
+      ok: false,
+      error: 'Google Logo Search requires GEMINI_API_KEY on the server. You can open Google Images directly or paste an image URL below.',
+      googleImagesUrl,
+      results: []
+    });
+  }
+
+  try {
+    const prompt = `Search Google for official, high-resolution, publicly accessible brand logo raster image URLs (PNG, JPG, or WebP — avoid SVG if a PNG/JPG exists) for the retail/beverage brand: "${rawQuery}".
+
+Prefer direct image URLs from Wikimedia Commons (upload.wikimedia.org), Wikipedia thumbnails, official brand media/press pages, or clean logo CDNs that return an actual PNG/JPG/WebP image file.
+
+Return ONLY a valid JSON object (no markdown code fences) in this exact format:
+{
+  "results": [
+    {
+      "title": "Short descriptive label of this logo",
+      "imageUrl": "https://...direct-image-url.png",
+      "sourceUrl": "https://...source-page-url",
+      "domain": "upload.wikimedia.org"
+    }
+  ]
+}
+Include up to 6 real image URLs found in your Google Search results. Do not invent or guess URLs.`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: prompt,
+      config: {
+        tools: [{ googleSearch: {} }]
+      }
+    });
+
+    const rawText = (response.text || '').trim();
+    const cleanedJson = rawText
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim();
+
+    let candidates: Array<{ title: string; imageUrl: string; sourceUrl?: string; domain?: string }> = [];
+    try {
+      const jsonMatch = cleanedJson.match(/\{[\s\S]*\}/);
+      const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : cleanedJson);
+      if (Array.isArray(parsed?.results)) {
+        candidates = parsed.results;
+      }
+    } catch {
+      candidates = [];
+    }
+
+    const seenUrls = new Set<string>();
+    const safeResults: Array<{ title: string; imageUrl: string; sourceUrl: string; domain: string }> = [];
+
+    for (const item of candidates) {
+      if (!item || typeof item.imageUrl !== 'string') continue;
+      const check = validatePublicImageUrl(item.imageUrl);
+      if (!check.ok || !check.url) continue;
+      const normalized = check.url.toString();
+      if (seenUrls.has(normalized)) continue;
+      seenUrls.add(normalized);
+
+      let safeSource = '';
+      if (typeof item.sourceUrl === 'string') {
+        const srcCheck = validatePublicImageUrl(item.sourceUrl);
+        if (srcCheck.ok && srcCheck.url) {
+          safeSource = srcCheck.url.toString();
+        }
+      }
+
+      safeResults.push({
+        title: String(item.title || `${rawQuery} Logo`).slice(0, 100),
+        imageUrl: normalized,
+        sourceUrl: safeSource || normalized,
+        domain: check.url.hostname
+      });
+      if (safeResults.length >= 6) break;
+    }
+
+    // Collect grounding source links from Gemini search metadata for user transparency
+    const groundingSources: Array<{ title: string; url: string }> = [];
+    const chunks = (response as any)?.candidates?.[0]?.groundingMetadata?.groundingChunks;
+    if (Array.isArray(chunks)) {
+      for (const ch of chunks) {
+        const uri = ch?.web?.uri;
+        if (typeof uri === 'string') {
+          const check = validatePublicImageUrl(uri);
+          if (check.ok && check.url) {
+            groundingSources.push({
+              title: String(ch?.web?.title || check.url.hostname).slice(0, 80),
+              url: check.url.toString()
+            });
+          }
+        }
+        if (groundingSources.length >= 6) break;
+      }
+    }
+
+    return res.json({
+      ok: true,
+      query: rawQuery,
+      googleImagesUrl,
+      results: safeResults,
+      groundingSources
+    });
+  } catch (err: any) {
+    const rawMsg = String(err?.message || 'Unable to reach search service.');
+    let friendlyMsg = rawMsg;
+    try {
+      const parsedErr = JSON.parse(rawMsg);
+      if (parsedErr?.error?.message) {
+        friendlyMsg = parsedErr.error.message;
+      }
+    } catch {
+      // keep rawMsg
+    }
+    console.error('[Brand Logo Search Error]:', friendlyMsg);
+    return res.status(502).json({
+      ok: false,
+      error: `Google logo search unavailable (${friendlyMsg}). You can open Google Images below and paste any logo URL or upload a photo.`,
+      googleImagesUrl,
+      results: []
+    });
+  }
+});
+
+/**
+ * POST /api/brand-logo/fetch
+ * Downloads a verified public HTTPS raster image server-side (SSRF-protected)
+ * and returns a base64 data URL for canvas resizing and Firestore/PDF embedding.
+ */
+app.post('/api/brand-logo/fetch', async (req, res) => {
+  try {
+    const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+    const result = await fetchSafeRemoteImage(rawUrl);
+    if (!result.ok) {
+      return res.status(result.status).json({ ok: false, error: result.error });
+    }
+    return res.json({
+      ok: true,
+      dataUrl: result.dataUrl,
+      contentType: result.contentType
+    });
+  } catch (err: any) {
+    console.error('[Brand Logo Fetch Error]:', err?.message || err);
+    return res.status(502).json({
+      ok: false,
+      error: `Could not fetch logo image: ${err?.message || 'Network timeout or unreachable host.'}`
+    });
+  }
+});
+
 
 async function startServer() {
   const isDev = process.env.NODE_ENV !== 'production';
@@ -378,7 +643,7 @@ async function startServer() {
   if (isDev) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false },
       appType: 'spa'
     });
     app.use(vite.middlewares);
@@ -396,19 +661,12 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, HOST, () => {
+  const server = app.listen(PORT, HOST, () => {
     console.log(`Server running at http://${HOST}:${PORT}`);
   });
-
-  if (ALT_PORT) {
-    try {
-      app.listen(ALT_PORT, HOST, () => {
-        console.log(`Also listening at http://${HOST}:${ALT_PORT}`);
-      });
-    } catch (err: any) {
-      console.warn(`Could not listen on alternate port ${ALT_PORT}:`, err.message);
-    }
-  }
+  server.on('error', (err: any) => {
+    console.error(`Server failed to listen on ${HOST}:${PORT}:`, err?.message || err);
+  });
 }
 
 startServer();
