@@ -17,6 +17,11 @@ import {
   getAveryPdfBlobUrl
 } from './avery_labels.js';
 import {
+  buildCustomerPriceListItems,
+  saveCustomerPriceListPdf,
+  getCustomerPriceListPdfBlobUrl
+} from './price_list_pdf.js';
+import {
   getLocalMasterItems,
   saveLocalMasterItems,
   fetchMasterItemsFromCloud,
@@ -251,6 +256,8 @@ export function App() {
   const [averyDrawGuides, setAveryDrawGuides] = useState<boolean>(false);
   const [averyPdfPreviewUrl, setAveryPdfPreviewUrl] = useState<string | null>(null);
   const [isPdfModalOpen, setIsPdfModalOpen] = useState<boolean>(false);
+  const [priceListCategoryFilter, setPriceListCategoryFilter] = useState<string>('all');
+  const [priceListGroupByCategory, setPriceListGroupByCategory] = useState<boolean>(true);
   const [averyPrintMode, setAveryPrintMode] = useState<'all' | 'current' | 'range'>('all');
   const [averyCurrentPage, setAveryCurrentPage] = useState<number>(1);
   const [averyRangeStart, setAveryRangeStart] = useState<number>(1);
@@ -373,7 +380,7 @@ export function App() {
     const unsub = onAuthChange(async (user: any) => {
       setCurrentUser(user);
       if (user) {
-        refreshCloudSessions();
+        void refreshCloudSessions();
         try {
           const cloudItems = await fetchMasterItemsFromCloud();
           if (cloudItems && cloudItems.length > 0) {
@@ -1047,7 +1054,7 @@ export function App() {
     rows.forEach((r) => {
       if (r.category && String(r.category).trim()) set.add(String(r.category).trim());
     });
-    return Array.from(set).sort();
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [rows]);
 
   // 4. Step 4: Toast Export and Previews
@@ -1098,6 +1105,43 @@ export function App() {
     const csv = toCsv(toastTable);
     downloadFile(filename, csv);
     postAnnouncement(`⬇️ Downloaded ${filename} (${toastTable.length - 1} items) ready for Toast POS!`);
+  };
+
+  const handleDownloadCustomerPriceListPdf = () => {
+    const sourceRows = rows.length > 0 ? rows : masterItems;
+    const customerItems = buildCustomerPriceListItems(sourceRows, {
+      categoryFilter: priceListCategoryFilter
+    });
+    if (customerItems.length === 0) {
+      setStatusText('No items available to export in the Customer Price List PDF.');
+      return;
+    }
+    const filename = saveCustomerPriceListPdf(sourceRows, {
+      storeName: averyStoreName || '777 Liquor Store',
+      title: 'Customer Price List',
+      groupByCategory: priceListGroupByCategory,
+      categoryFilter: priceListCategoryFilter
+    });
+    postAnnouncement(`📄 Downloaded Customer Price List PDF "${filename}" (${customerItems.length} items — Item Name, Category & Price only, barcodes/SKUs excluded).`);
+  };
+
+  const handlePreviewCustomerPriceListPdf = () => {
+    const sourceRows = rows.length > 0 ? rows : masterItems;
+    const customerItems = buildCustomerPriceListItems(sourceRows, {
+      categoryFilter: priceListCategoryFilter
+    });
+    if (customerItems.length === 0) {
+      setStatusText('No items available to preview in the Customer Price List PDF.');
+      return;
+    }
+    const { url } = getCustomerPriceListPdfBlobUrl(sourceRows, {
+      storeName: averyStoreName || '777 Liquor Store',
+      title: 'Customer Price List',
+      groupByCategory: priceListGroupByCategory,
+      categoryFilter: priceListCategoryFilter
+    });
+    setAveryPdfPreviewUrl(url);
+    setIsPdfModalOpen(true);
   };
 
   // Preview filtering and summary
@@ -1167,7 +1211,7 @@ export function App() {
     averyAllItems.forEach((i) => {
       if (i.brand) set.add(i.brand);
     });
-    return Array.from(set).sort();
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [averyAllItems]);
 
   const averyAvailableCategories = useMemo(() => {
@@ -1175,7 +1219,7 @@ export function App() {
     averyAllItems.forEach((i) => {
       if (i.category) set.add(i.category);
     });
-    return Array.from(set).sort();
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [averyAllItems]);
 
   const averyFilteredItems = useMemo(() => {
@@ -1776,11 +1820,10 @@ export function App() {
       <header className="app-header">
         <div className="app-title-group">
           <h1>
-            <span>🍀 Clover → 🍞 Toast</span>
-            <span className="app-title-badge">Retail Import Studio</span>
+            <span>🍀 CLOVER/TOAST INVENTORY TRANSFER TOOL &amp; TAG MAKER</span>
           </h1>
           <p className="note" style={{ margin: 0 }}>
-            Transform messy Clover POS spreadsheets into 100% compliant Toast import files using <strong>barcode as the product identity</strong>.
+            Transform messy Clover POS spreadsheets into 100% compliant Toast import files, customer price lists, and custom Avery price tags.
           </p>
         </div>
         <div className="auth-bar">
@@ -1992,7 +2035,7 @@ export function App() {
                   e.preventDefault();
                   e.currentTarget.classList.remove('dragover');
                   if (e.dataTransfer.files?.[0]) {
-                    handleFileUpload(e.dataTransfer.files[0]);
+                    void handleFileUpload(e.dataTransfer.files[0]);
                   }
                 }}
                 onClick={() => fileInputRef.current?.click()}
@@ -2007,7 +2050,7 @@ export function App() {
                   style={{ display: 'none' }}
                   onChange={(e) => {
                     if (e.target.files?.[0]) {
-                      handleFileUpload(e.target.files[0]);
+                      void handleFileUpload(e.target.files[0]);
                     }
                   }}
                 />
@@ -2809,6 +2852,48 @@ export function App() {
                     </button>
                   </div>
                 </div>
+
+                {/* Card 5: Simplified Customer Price List PDF */}
+                <div className="export-card" style={{ borderColor: '#0284c7', background: 'linear-gradient(135deg, rgba(2, 132, 199, 0.14) 0%, rgba(15, 23, 42, 0.85) 100%)' }}>
+                  <div>
+                    <h3 className="export-card-title">
+                      <span>📄 Customer Price List PDF</span>
+                      <span className="app-title-badge" style={{ background: '#0284c7' }}>Customer-Facing</span>
+                    </h3>
+                    <p className="export-card-desc">
+                      Generate a clean, printable store price list for customers featuring <strong>Item Name, Category, and Price only</strong> — strictly excluding barcodes, SKUs, and internal POS data.
+                    </p>
+                    <div className="flex-wrap" style={{ gap: 8, alignItems: 'center', marginBottom: 12 }}>
+                      <select
+                        className="bulk-edit-select"
+                        value={priceListCategoryFilter}
+                        onChange={(e) => setPriceListCategoryFilter(e.target.value)}
+                        aria-label="Filter Customer Price List by category"
+                      >
+                        <option value="all">All Categories</option>
+                        {availableStep3Categories.map((cat) => (
+                          <option key={cat} value={cat}>{cat}</option>
+                        ))}
+                      </select>
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: '#cbd5e1', cursor: 'pointer' }}>
+                        <input
+                          type="checkbox"
+                          checked={priceListGroupByCategory}
+                          onChange={(e) => setPriceListGroupByCategory(e.target.checked)}
+                        />
+                        <span>Group by Category</span>
+                      </label>
+                    </div>
+                  </div>
+                  <div className="flex-wrap" style={{ gap: 8 }}>
+                    <button type="button" className="btn-outline btn-sm" onClick={handlePreviewCustomerPriceListPdf}>
+                      👁️ Preview Price List PDF
+                    </button>
+                    <button type="button" className="btn-toast" style={{ background: '#0284c7' }} onClick={handleDownloadCustomerPriceListPdf}>
+                      ⬇️ Download Price List PDF
+                    </button>
+                  </div>
+                </div>
               </div>
 
               {/* Embedded Toast Consultant Guidance Card */}
@@ -3005,7 +3090,7 @@ export function App() {
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault();
-                      handleSendAiPrompt();
+                      void handleSendAiPrompt();
                     }
                   }}
                 />
@@ -4052,7 +4137,7 @@ export function App() {
                                 value={logoSearchQuery}
                                 onChange={(e) => setLogoSearchQuery(e.target.value)}
                                 onKeyDown={(e) => {
-                                  if (e.key === 'Enter') handleSearchGoogleLogos();
+                                  if (e.key === 'Enter') void handleSearchGoogleLogos();
                                 }}
                               />
                               <button

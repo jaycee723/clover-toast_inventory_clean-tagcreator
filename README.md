@@ -1,6 +1,6 @@
-# 🍀 Clover to Toast Retail Import Studio & Avery Price Tag Studio
+# 🍀 CLOVER/TOAST INVENTORY TRANSFER TOOL & TAG MAKER
 
-A high-performance full-stack web application designed for retail and liquor store operators to seamlessly clean and standardize Clover POS spreadsheets into 100% compliant Toast POS catalogs, maintain a permanent Master Inventory database with pre-merge reconciliation, and generate customizable Avery shelf price tags with embedded brand logos.
+A high-performance full-stack web application designed for retail and liquor store operators to seamlessly clean and standardize Clover POS spreadsheets into 100% compliant Toast POS catalogs, maintain a permanent Master Inventory database with pre-merge reconciliation, export customer-facing price list PDFs, and generate customizable Avery shelf price tags with embedded brand logos.
 
 ---
 

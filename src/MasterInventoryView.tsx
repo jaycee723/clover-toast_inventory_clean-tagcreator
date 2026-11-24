@@ -46,7 +46,7 @@ export const MasterInventoryView: React.FC<MasterInventoryViewProps> = ({
     items.forEach((i) => {
       if (i.category) set.add(i.category);
     });
-    return Array.from(set).sort();
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [items]);
 
   const brands = useMemo(() => {
@@ -54,7 +54,7 @@ export const MasterInventoryView: React.FC<MasterInventoryViewProps> = ({
     items.forEach((i) => {
       if (i.brand) set.add(i.brand);
     });
-    return Array.from(set).sort();
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [items]);
 
   // Filtered & Sorted items

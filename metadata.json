@@ -1,6 +1,6 @@
 {
-  "name": "Inventory identity review",
-  "description": "In-browser Clover to Toast inventory review, barcode identity matching, and cleaning tool.",
+  "name": "CLOVER/TOAST INVENTORY TRANSFER TOOL & TAG MAKER",
+  "description": "In-browser Clover to Toast inventory transfer, barcode identity cleaning, customer price list PDF, and Avery price tag maker.",
   "permissions": [],
   "capabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

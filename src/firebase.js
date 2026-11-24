@@ -14,18 +14,9 @@ import {
   orderBy,
 } from 'firebase/firestore';
 
-export const firebaseConfig = {
-  projectId: "gen-lang-client-0818748893",
-  appId: "1:631752805082:web:a11e38801d3a82c326f3e3",
-  apiKey: "AIzaSyAQGoK6J2FVfv8OSqWc8L5OD5f0MqJtxyk",
-  authDomain: "gen-lang-client-0818748893.firebaseapp.com",
-  firestoreDatabaseId: "ai-studio-clovertoastinven-34640a8c-f990-49f8-9484-bf8ae1f0691b",
-  storageBucket: "gen-lang-client-0818748893.firebasestorage.app",
-  messagingSenderId: "631752805082",
-  measurementId: "",
-  oAuthClientId: "631752805082-kucmu5mgth3ds4uj1khkjfnsglko9ajg.apps.googleusercontent.com",
-  recaptchaSiteKey: ""
-};
+import firebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
+
+export { firebaseConfig };
 
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId); /* CRITICAL: The app will break without this line */

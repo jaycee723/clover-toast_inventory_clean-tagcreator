@@ -669,6 +669,8 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Fatal server startup error:', err);
+});
 
 export { app, isGeminiConfigured };
